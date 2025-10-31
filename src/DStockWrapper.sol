@@ -151,7 +151,7 @@ contract DStockWrapper is
   function wrap(address token, uint256 amount, address to)
     external
     nonReentrant
-    whenNotPaused
+    whenOperational
     updateMultiplier
     returns (uint256 net18, uint256 mintedShares)
   {
@@ -192,7 +192,7 @@ contract DStockWrapper is
   function unwrap(address token, uint256 amount, address to)
     external
     nonReentrant
-    whenNotPaused
+    whenOperational
     updateMultiplier
   {
     UnderlyingInfo storage info = underlyings[token];
@@ -234,7 +234,7 @@ contract DStockWrapper is
     internal
     override
     updateMultiplier
-    whenNotPaused
+    whenOperational
   {
     if (from == address(0) || to == address(0)) {
       super._update(from, to, value);
@@ -420,6 +420,12 @@ contract DStockWrapper is
   // ---------- INTERNAL ----------
   modifier updateMultiplier() {
     _applyAccruedFee();
+    _;
+  }
+
+  /// @dev Business gating: both OZ pause and factory pause must be false.
+  modifier whenOperational() {
+    require(!paused() && !pausedByFactory, "paused");
     _;
   }
 
