@@ -140,6 +140,7 @@ contract DStockFactoryRegistry is AccessControl {
   /// @notice Set the global compliance module (wrappers may override locally)
   function setGlobalCompliance(address c) external onlyRole(OPERATOR_ROLE) {
     address old = globalCompliance;
+    if (old == c) revert SameAddress();
     globalCompliance = c; // can be zero to disable compliance checks by default
     emit GlobalComplianceChanged(old, c);
   }
@@ -166,6 +167,8 @@ contract DStockFactoryRegistry is AccessControl {
     onlyRole(OPERATOR_ROLE)
   {
     if (!isWrapper[wrapper]) revert NotRegistered();
+    if (deprecated[wrapper]) revert InvalidParams("deprecated wrapper");
+    if (IDStockWrapper(wrapper).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
     if (tokens.length == 0) revert InvalidParams("empty tokens");
 
     // Validate and ensure no conflicts before mutating state

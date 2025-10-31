@@ -100,6 +100,8 @@ contract DStockWrapper is
   error UnknownUnderlying();
   error UnsupportedUnderlying();
   error InsufficientLiquidity();
+  error FeeTreasuryRequired();
+  error NoChange();
 
   // ---------- INITIALIZER ----------
   function initialize(IDStockWrapper.InitParams calldata p) external initializer {
@@ -256,36 +258,44 @@ contract DStockWrapper is
   // ---------- GOVERNANCE ----------
   function setCompliance(address c) external onlyRole(OPERATOR_ROLE) {
     address old = address(compliance);
+    if (old == c) revert NoChange();
     compliance = IDStockCompliance(c);
     emit ComplianceChanged(old, c);
   }
 
   function setTreasury(address t) external onlyRole(OPERATOR_ROLE) {
     address old = treasury;
+    if (old == t) revert NoChange();
     treasury = t;
     emit TreasuryChanged(old, t);
   }
 
   function setWrapFeeBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
     uint16 old = wrapFeeBps;
+    if (old == bps) revert NoChange();
+    if (bps > 0 && treasury == address(0)) revert FeeTreasuryRequired();
     wrapFeeBps = bps;
     emit WrapFeeChanged(old, bps);
   }
 
   function setUnwrapFeeBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
     uint16 old = unwrapFeeBps;
+    if (old == bps) revert NoChange();
+    if (bps > 0 && treasury == address(0)) revert FeeTreasuryRequired();
     unwrapFeeBps = bps;
     emit UnwrapFeeChanged(old, bps);
   }
 
   function setCap(uint256 newCap) external onlyRole(OPERATOR_ROLE) {
     uint256 old = cap;
+    if (old == newCap) revert NoChange();
     cap = newCap;
     emit CapChanged(old, newCap);
   }
 
   function setTermsURI(string calldata uri) external onlyRole(OPERATOR_ROLE) {
     string memory old = termsURI;
+    if (keccak256(bytes(old)) == keccak256(bytes(uri))) revert NoChange();
     termsURI = uri;
     emit TermsURIChanged(old, uri);
   }
@@ -293,6 +303,7 @@ contract DStockWrapper is
   function setTokenName(string calldata newName) external onlyRole(OPERATOR_ROLE) {
     require(bytes(newName).length != 0, "empty name");
     string memory old = _tokenName;
+    if (keccak256(bytes(old)) == keccak256(bytes(newName))) revert NoChange();
     _tokenName = newName;
     emit TokenNameChanged(old, newName);
   }
@@ -300,6 +311,7 @@ contract DStockWrapper is
   function setTokenSymbol(string calldata newSymbol) external onlyRole(OPERATOR_ROLE) {
     require(bytes(newSymbol).length != 0, "empty symbol");
     string memory old = _tokenSymbol;
+    if (keccak256(bytes(old)) == keccak256(bytes(newSymbol))) revert NoChange();
     _tokenSymbol = newSymbol;
     emit TokenSymbolChanged(old, newSymbol);
   }
@@ -328,6 +340,9 @@ contract DStockWrapper is
   function setRebaseParams(uint256 _feePerPeriodRay, uint32 _periodLength, uint8 _feeModel)
     external onlyRole(OPERATOR_ROLE) updateMultiplier
   {
+    if (feePerPeriodRay == _feePerPeriodRay && periodLength == _periodLength && feeModel == _feeModel) {
+      revert NoChange();
+    }
     feePerPeriodRay = _feePerPeriodRay;
     periodLength    = _periodLength;
     feeModel        = _feeModel;
