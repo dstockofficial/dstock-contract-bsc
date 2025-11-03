@@ -90,6 +90,7 @@ contract DStockWrapper is
   event UnderlyingAdded(address indexed token, uint8 decimals);
   event UnderlyingStatusChanged(address indexed token, bool enabled);
   event ForceMovedToTreasury(address indexed from, address indexed treasury, uint256 amount, uint256 shares);
+  event HoldingFeesSkimmed(uint256 surplus18, address indexed treasury);
 
   // ---------- ERRORS ----------
   error NotAllowed();
@@ -432,6 +433,56 @@ contract DStockWrapper is
     if (info.decimals == 0) revert UnknownUnderlying();
     info.enabled = enabled;
     emit UnderlyingStatusChanged(token, enabled);
+  }
+
+  /// @notice Collect surplus liquidity created by holding-fee (multiplier decay) to the treasury.
+  function skimHoldingFees() external onlyRole(OPERATOR_ROLE) nonReentrant updateMultiplier {
+    address dst = treasury;
+    if (dst == address(0)) revert ZeroAddress();
+
+    // Compute required liability and available liquidity (in 18-decimal terms)
+    uint256 required18 = _toAmount(_totalShares);
+    uint256 available18 = 0;
+    uint256 enabledCount = 0;
+    for (uint256 i = 0; i < allUnderlyings.length; i++) {
+      address u = allUnderlyings[i];
+      if (!underlyings[u].enabled) continue;
+      enabledCount += 1;
+      uint256 bal = IERC20(u).balanceOf(address(this));
+      available18 += _normalize(u, bal);
+    }
+    if (available18 <= required18 || enabledCount == 0) return;
+
+    uint256 surplus18 = available18 - required18;
+    uint256 totalSkimmed18 = 0;
+
+    // Distribute proportional skim over enabled underlyings
+    for (uint256 i = 0; i < allUnderlyings.length; i++) {
+      address u = allUnderlyings[i];
+      UnderlyingInfo storage info = underlyings[u];
+      if (!info.enabled) continue;
+
+      uint256 balToken = IERC20(u).balanceOf(address(this));
+      uint256 bal18 = _normalize(u, balToken);
+      uint256 skim18;
+      if (i == allUnderlyings.length - 1) {
+        // last token takes remainder to avoid rounding dust
+        skim18 = surplus18 - totalSkimmed18;
+      } else {
+        skim18 = (surplus18 * bal18) / available18;
+      }
+      if (skim18 == 0) continue;
+      uint256 skimToken = _denormalize(u, skim18);
+      if (skimToken == 0) continue;
+
+      // Reduce recorded liquidity and transfer skim to treasury
+      uint256 liq = info.liquidToken;
+      info.liquidToken = (liq > skimToken) ? (liq - skimToken) : 0;
+      IERC20(u).safeTransfer(dst, skimToken);
+      totalSkimmed18 += skim18;
+    }
+
+    emit HoldingFeesSkimmed(surplus18, dst);
   }
 
   // ---------- INTERNAL ----------

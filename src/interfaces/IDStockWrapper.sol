@@ -39,6 +39,9 @@ interface IDStockWrapper {
   function addUnderlying(address token) external;
   function setUnderlyingEnabled(address token, bool enabled) external;
 
+  // ---- fees ops ----
+  function skimHoldingFees() external;
+
   // ---- multi-underlying business (frontends/scripts will call these) ----
   /// @notice Wrap exact `amount` of `token` into the unified d-stock.
   /// @return net18    Amount credited in 18-decimal amount terms after fee.
