@@ -37,7 +37,7 @@ contract DStockWrapper is
   uint256 private constant RAY = 1e18;
 
   // ---------- CONFIG ----------
-  address public factoryRegistry;       // optional back-pointer
+  address public factoryRegistry;       // back-pointer to factory
   IDStockCompliance public compliance;  // can be 0
   address public treasury;              // fee sink (can be 0)
   uint16  public wrapFeeBps;            // 0 ok
@@ -106,6 +106,7 @@ contract DStockWrapper is
   // ---------- INITIALIZER ----------
   function initialize(IDStockWrapper.InitParams calldata p) external initializer {
     if (p.admin == address(0)) revert ZeroAddress();
+    if (p.factoryRegistry == address(0)) revert ZeroAddress();
 
     _tokenName  = p.name;
     _tokenSymbol = p.symbol;
@@ -425,11 +426,13 @@ contract DStockWrapper is
     return (info.enabled, info.decimals, info.liquidToken);
   }
 
-  function addUnderlying(address token) external onlyRole(OPERATOR_ROLE) {
+  function addUnderlying(address token) external {
+    if (msg.sender != factoryRegistry) revert NotAllowed();
     _addUnderlying(token);
   }
 
-  function setUnderlyingEnabled(address token, bool enabled) external onlyRole(OPERATOR_ROLE) {
+  function setUnderlyingEnabled(address token, bool enabled) external {
+    if (msg.sender != factoryRegistry) revert NotAllowed();
     UnderlyingInfo storage info = underlyings[token];
     if (info.decimals == 0) revert UnknownUnderlying();
     info.enabled = enabled;

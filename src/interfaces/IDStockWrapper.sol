@@ -33,6 +33,7 @@ interface IDStockWrapper {
   // ---- lifecycle (factory uses this) ----
   function initialize(InitParams calldata p) external;
   function setPausedByFactory(bool paused) external;
+  function factoryRegistry() external view returns (address);
 
   // ---- multi-underlying admin (optional for factory; used by ops) ----
   function addUnderlying(address token) external;
