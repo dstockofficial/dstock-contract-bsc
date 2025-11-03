@@ -2,7 +2,6 @@
 pragma solidity ^0.8.26;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
@@ -23,15 +22,13 @@ contract DStockWrapper is
   ERC20Upgradeable,
   AccessControlUpgradeable,
   PausableUpgradeable,
-  ReentrancyGuardUpgradeable,
-  UUPSUpgradeable
+  ReentrancyGuardUpgradeable
 {
   using SafeERC20 for IERC20;
 
   // ---------- ROLES ----------
   bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
   bytes32 public constant PAUSER_ROLE   = keccak256("PAUSER_ROLE");
-  bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
   // ---------- CONSTANTS ----------
   uint256 private constant RAY = 1e18;
@@ -118,12 +115,10 @@ contract DStockWrapper is
     __AccessControl_init();
     __Pausable_init();
     __ReentrancyGuard_init();
-    __UUPSUpgradeable_init();
 
     _grantRole(DEFAULT_ADMIN_ROLE, p.admin);
     _grantRole(OPERATOR_ROLE, p.admin);
     _grantRole(PAUSER_ROLE, p.admin);
-    _grantRole(UPGRADER_ROLE, p.admin);
 
     factoryRegistry    = p.factoryRegistry;
     compliance         = IDStockCompliance(p.compliance);
@@ -246,10 +241,6 @@ contract DStockWrapper is
     updateMultiplier
     whenOperational
   {
-    if (from == address(0) || to == address(0)) {
-      super._update(from, to, value);
-      return;
-    }
     if (value == 0) return;
 
     _checkCompliance(from, to, value, 0 /* Transfer */);
@@ -454,7 +445,7 @@ contract DStockWrapper is
     _;
   }
 
-  function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
+  
 
   function _toShares(uint256 amount18) internal view returns (uint256) {
     return (amount18 == 0) ? 0 : (amount18 * RAY) / multiplier;
@@ -576,10 +567,7 @@ contract DStockWrapper is
     emit UnderlyingAdded(token, dec);
   }
 
-  // total implicit liability (18-decimal)
-  function totalDebt_() internal view returns (uint256) {
-    return _toAmount(_totalShares);
-  }
+  
 
   function harvestFees() external { _applyAccruedFee(); }
 }
