@@ -164,19 +164,18 @@ contract DStockWrapper is
 
     _checkCompliance(msg.sender, to, amount, 1 /* Wrap */);
 
+    uint256 balBefore = IERC20(token).balanceOf(address(this));
     IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+    uint256 received = IERC20(token).balanceOf(address(this)) - balBefore;
 
-    uint256 gross18 = _normalize(token, amount);
+    uint256 gross18 = _normalize(token, received);
     uint256 fee18   = (wrapFeeBps == 0) ? 0 : (gross18 * wrapFeeBps) / 10_000;
     net18 = gross18 - fee18;
 
-    // move fee to treasury (token units) and track net liquidity
+    // move fee to treasury (token units)
     if (fee18 > 0 && treasury != address(0)) {
       uint256 feeToken = _denormalize(token, fee18);
       if (feeToken > 0) IERC20(token).safeTransfer(treasury, feeToken);
-      info.liquidToken += (amount - feeToken);
-    } else {
-      info.liquidToken += amount;
     }
 
     uint256 s = _toShares(net18);
@@ -221,12 +220,12 @@ contract DStockWrapper is
     uint256 net18 = gross18 - fee18;
 
     uint256 needOut = netToken + ((treasury != address(0) && feeToken > 0) ? feeToken : 0);
-    if (info.liquidToken < needOut) revert InsufficientLiquidity();
+    uint256 currentBal = IERC20(token).balanceOf(address(this));
+    if (currentBal < needOut) revert InsufficientLiquidity();
 
     _shares[msg.sender] -= s;
     _totalShares        -= s;
 
-    info.liquidToken    -= needOut;
     if (feeToken > 0 && treasury != address(0)) {
       IERC20(token).safeTransfer(treasury, feeToken);
     }
@@ -432,7 +431,7 @@ contract DStockWrapper is
     returns (bool enabled, uint8 tokenDecimals, uint256 liquidToken)
   {
     UnderlyingInfo memory info = underlyings[token];
-    return (info.enabled, info.decimals, info.liquidToken);
+    return (info.enabled, info.decimals, IERC20(token).balanceOf(address(this)));
   }
 
   function addUnderlying(address token) external {
@@ -488,9 +487,7 @@ contract DStockWrapper is
       uint256 skimToken = _denormalize(u, skim18);
       if (skimToken == 0) continue;
 
-      // Reduce recorded liquidity and transfer skim to treasury
-      uint256 liq = info.liquidToken;
-      info.liquidToken = (liq > skimToken) ? (liq - skimToken) : 0;
+      // Transfer skim to treasury; live balances are authoritative
       IERC20(u).safeTransfer(dst, skimToken);
       totalSkimmed18 += skim18;
     }
