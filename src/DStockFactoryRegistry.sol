@@ -178,11 +178,19 @@ contract DStockFactoryRegistry is AccessControl {
       if (wrapperOf[u] != address(0)) revert AlreadyRegistered();
     }
 
-    // Call wrapper to enable each underlying, then map
+    // Add or re-enable per underlying, then map
     for (uint256 i = 0; i < tokens.length; i++) {
-      IDStockWrapper(wrapper).addUnderlying(tokens[i]);
-      wrapperOf[tokens[i]] = wrapper;
-      emit UnderlyingMapped(tokens[i], wrapper);
+      address u = tokens[i];
+      (bool isEnabled, uint8 tokenDecimals, ) = IDStockWrapper(wrapper).underlyingInfo(u);
+      if (tokenDecimals == 0) {
+        IDStockWrapper(wrapper).addUnderlying(u);
+      } else if (!isEnabled) {
+        IDStockWrapper(wrapper).setUnderlyingEnabled(u, true);
+      } else {
+        revert InvalidParams("token already enabled in wrapper");
+      }
+      wrapperOf[u] = wrapper;
+      emit UnderlyingMapped(u, wrapper);
     }
 
     emit UnderlyingsAdded(wrapper, tokens);
