@@ -333,6 +333,19 @@ contract DStockWrapper is
     require(numerator > 0 && denominator > 0, "bad ratio");
     uint256 oldM = multiplier;
     uint256 newM = (oldM * numerator) / denominator;
+
+    // If multiplier increases, ensure sufficient available liquidity to cover new liability
+    if (newM > oldM) {
+      uint256 required18 = (_totalShares * (newM > 0 ? newM : 1)) / RAY;
+      uint256 available18 = 0;
+      for (uint256 i = 0; i < allUnderlyings.length; i++) {
+        address u = allUnderlyings[i];
+        if (!underlyings[u].enabled) continue;
+        uint256 bal = IERC20(u).balanceOf(address(this));
+        available18 += _normalize(u, bal);
+      }
+      if (available18 < required18) revert InsufficientLiquidity();
+    }
     multiplier = newM > 0 ? newM : 1;
     emit SplitApplied(numerator, denominator, oldM, multiplier);
     emit MultiplierUpdated(multiplier);
