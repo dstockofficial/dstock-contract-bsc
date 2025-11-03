@@ -39,6 +39,9 @@ contract DStockWrapper is
   // ---------- CONFIG ----------
   address public factoryRegistry;       // back-pointer to factory
   IDStockCompliance public compliance;  // can be 0
+  constructor() {
+    _disableInitializers();
+  }
   address public treasury;              // fee sink (can be 0)
   uint16  public wrapFeeBps;            // 0 ok
   uint16  public unwrapFeeBps;          // 0 ok
