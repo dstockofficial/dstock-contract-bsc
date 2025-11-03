@@ -216,12 +216,13 @@ contract DStockWrapper is
     uint256 feeToken = _denormalize(token, fee18);
     uint256 netToken = _denormalize(token, net18);
 
-    if (info.liquidToken < netToken) revert InsufficientLiquidity();
+    uint256 needOut = netToken + ((treasury != address(0) && feeToken > 0) ? feeToken : 0);
+    if (info.liquidToken < needOut) revert InsufficientLiquidity();
 
     _shares[msg.sender] -= s;
     _totalShares        -= s;
 
-    info.liquidToken    -= netToken;
+    info.liquidToken    -= needOut;
     if (feeToken > 0 && treasury != address(0)) {
       IERC20(token).safeTransfer(treasury, feeToken);
     }
