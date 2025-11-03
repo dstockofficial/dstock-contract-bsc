@@ -107,6 +107,7 @@ contract DStockWrapper is
   function initialize(IDStockWrapper.InitParams calldata p) external initializer {
     if (p.admin == address(0)) revert ZeroAddress();
     if (p.factoryRegistry == address(0)) revert ZeroAddress();
+    if ((p.wrapFeeBps > 0 || p.unwrapFeeBps > 0) && p.treasury == address(0)) revert FeeTreasuryRequired();
 
     _tokenName  = p.name;
     _tokenSymbol = p.symbol;
