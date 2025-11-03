@@ -210,11 +210,14 @@ contract DStockWrapper is
     if (_toAmount(s) < gross18) s += 1;
     if (_shares[msg.sender] < s) revert InsufficientShares();
 
+    // compute fee/net in token native units to avoid double rounding; protect zero-net
+    uint256 feeToken = (unwrapFeeBps == 0) ? 0 : (amount * unwrapFeeBps) / 10_000;
+    uint256 netToken = amount - feeToken;
+    if (netToken == 0) revert TooSmall();
+
+    // for events, keep normalized values for analytics
     uint256 fee18 = (unwrapFeeBps == 0) ? 0 : (gross18 * unwrapFeeBps) / 10_000;
     uint256 net18 = gross18 - fee18;
-
-    uint256 feeToken = _denormalize(token, fee18);
-    uint256 netToken = _denormalize(token, net18);
 
     uint256 needOut = netToken + ((treasury != address(0) && feeToken > 0) ? feeToken : 0);
     if (info.liquidToken < needOut) revert InsufficientLiquidity();
