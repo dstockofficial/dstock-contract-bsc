@@ -434,11 +434,13 @@ contract DStockWrapper is
     return (info.enabled, info.decimals, IERC20(token).balanceOf(address(this)));
   }
 
+  /// @dev Factory-only to preserve registry invariant: one underlying -> one wrapper (Issue-12)
   function addUnderlying(address token) external {
     if (msg.sender != factoryRegistry) revert NotAllowed();
     _addUnderlying(token);
   }
 
+  /// @dev Factory-only to avoid bypassing registry checks (Issue-12)
   function setUnderlyingEnabled(address token, bool enabled) external {
     if (msg.sender != factoryRegistry) revert NotAllowed();
     UnderlyingInfo storage info = underlyings[token];
