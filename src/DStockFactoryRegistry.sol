@@ -188,11 +188,17 @@ contract DStockFactoryRegistry is AccessControl {
     emit UnderlyingsAdded(wrapper, tokens);
   }
 
-  /// @notice Remove a single underlying mapping (e.g., when disabled in the wrapper).
-  /// @dev This only updates the factory registry; wrapper is expected to be disabled via setUnderlyingEnabled(false).
+  /// @notice Remove a single underlying mapping and disable it on the wrapper atomically.
   function removeUnderlyingMapping(address underlying) external onlyRole(OPERATOR_ROLE) {
     address w = wrapperOf[underlying];
     if (w == address(0)) revert NotRegistered();
+    if (!isWrapper[w]) revert InvalidParams("not a wrapper");
+    if (IDStockWrapper(w).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
+
+    // Disable in wrapper first to ensure on-chain coordination
+    IDStockWrapper(w).setUnderlyingEnabled(underlying, false);
+
+    // Then unmap in registry
     wrapperOf[underlying] = address(0);
     emit UnderlyingUnmapped(underlying, w);
   }
