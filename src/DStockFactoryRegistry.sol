@@ -203,33 +203,7 @@ contract DStockFactoryRegistry is AccessControl {
     emit UnderlyingUnmapped(underlying, w);
   }
 
-  /// @notice Migrate a batch of underlyings from `oldWrapper` to `newWrapper`.
-  /// @dev Requires admin; will call `addUnderlying` on the new wrapper and remap each token.
-  function migrateUnderlyings(address[] calldata underlyings, address oldWrapper, address newWrapper)
-    external
-    onlyRole(DEFAULT_ADMIN_ROLE)
-  {
-    if (newWrapper == address(0) || oldWrapper == address(0)) revert ZeroAddress();
-    if (!isWrapper[oldWrapper]) revert InvalidParams("oldWrapper not a wrapper");
-    if (!isWrapper[newWrapper]) revert InvalidParams("newWrapper not a wrapper");
-    if (underlyings.length == 0) revert InvalidParams("empty underlyings");
-
-    // Validate ownership & conflicts
-    for (uint256 i = 0; i < underlyings.length; i++) {
-      address u = underlyings[i];
-      if (wrapperOf[u] != oldWrapper) revert InvalidParams("token not owned by oldWrapper");
-    }
-
-    // Add to new, remap
-    for (uint256 i = 0; i < underlyings.length; i++) {
-      address u = underlyings[i];
-      IDStockWrapper(newWrapper).addUnderlying(u);
-      wrapperOf[u] = newWrapper;
-      emit UnderlyingMapped(u, newWrapper);
-    }
-
-    emit UnderlyingsMigrated(oldWrapper, newWrapper, underlyings);
-  }
+  // migrateUnderlyings removed by design; migration should be handled explicitly off-chain
 
   // ============================= Views ===========================
 
