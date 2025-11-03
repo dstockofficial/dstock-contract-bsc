@@ -145,8 +145,8 @@ contract DStockWrapper is
   function name()   public view override returns (string memory) { return _tokenName; }
   function symbol() public view override returns (string memory) { return _tokenSymbol; }
   function decimals() public pure override returns (uint8) { return 18; }
-  function totalSupply() public view override returns (uint256) { return _toAmount(_totalShares); }
-  function balanceOf(address a) public view override returns (uint256) { return _toAmount(_shares[a]); }
+  function totalSupply() public view override returns (uint256) { return _toAmountView(_totalShares); }
+  function balanceOf(address a) public view override returns (uint256) { return _toAmountView(_shares[a]); }
 
   // ---------- BUSINESS ----------
   /// @notice Wrap `amount` of a specific `token` into the unified d-stock.
@@ -456,6 +456,17 @@ contract DStockWrapper is
 
   function _toAmount(uint256 shares) internal view returns (uint256) {
     return (shares == 0) ? 0 : (shares * multiplier) / RAY;
+  }
+
+  // View-only helpers using preview multiplier (fresh as of now)
+  function _currentMultiplierView() internal view returns (uint256 m) {
+    (m, ) = _previewApplyAccruedFee(multiplier, lastTimeFeeApplied);
+  }
+
+  function _toAmountView(uint256 shares) internal view returns (uint256) {
+    if (shares == 0) return 0;
+    uint256 m = _currentMultiplierView();
+    return (shares * m) / RAY;
   }
 
   // ======== SAFE RESCALING (supports decimals > 18) ========
