@@ -414,7 +414,7 @@ contract DStockWrapper is
   function underlyingInfo(address token)
     external
     view
-    returns (bool enabled, uint8 decimals, uint256 liquidToken)
+    returns (bool enabled, uint8 tokenDecimals, uint256 liquidToken)
   {
     UnderlyingInfo memory info = underlyings[token];
     return (info.enabled, info.decimals, info.liquidToken);
