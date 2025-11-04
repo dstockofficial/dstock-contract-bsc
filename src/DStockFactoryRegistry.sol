@@ -148,6 +148,8 @@ contract DStockFactoryRegistry is AccessControl {
   /// @notice Factory-level pause/unpause for a specific wrapper (wrapper must implement setPausedByFactory)
   function pauseWrapper(address wrapper, bool paused) external onlyRole(PAUSER_ROLE) {
     if (!isWrapper[wrapper]) revert NotRegistered();
+    // optional safety: ensure wrapper belongs to this factory
+    if (IDStockWrapper(wrapper).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
     IDStockWrapper(wrapper).setPausedByFactory(paused);
     emit WrapperPausedByFactory(wrapper, paused);
   }
@@ -178,7 +180,7 @@ contract DStockFactoryRegistry is AccessControl {
       if (wrapperOf[u] != address(0)) revert AlreadyRegistered();
     }
 
-    // Add or re-enable per underlying, then map
+    // For each token: if already present (decimals != 0) then re-enable; else add new
     for (uint256 i = 0; i < tokens.length; i++) {
       address u = tokens[i];
       (bool isEnabled, uint8 tokenDecimals, ) = IDStockWrapper(wrapper).underlyingInfo(u);
@@ -187,6 +189,7 @@ contract DStockFactoryRegistry is AccessControl {
       } else if (!isEnabled) {
         IDStockWrapper(wrapper).setUnderlyingEnabled(u, true);
       } else {
+        // already present and enabled in wrapper but not mapped -> inconsistent state
         revert InvalidParams("token already enabled in wrapper");
       }
       wrapperOf[u] = wrapper;
@@ -196,22 +199,31 @@ contract DStockFactoryRegistry is AccessControl {
     emit UnderlyingsAdded(wrapper, tokens);
   }
 
+  /// @notice Set only the enabled status of an existing underlying without changing mapping.
+  /// @dev All status changes go through factory; wrapper emits UnderlyingStatusChanged.
+  function setUnderlyingStatus(address underlying, bool enabled)
+    external
+    onlyRole(OPERATOR_ROLE)
+  {
+    address w = wrapperOf[underlying];
+    if (w == address(0)) revert NotRegistered();
+    if (IDStockWrapper(w).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
+    IDStockWrapper(w).setUnderlyingEnabled(underlying, enabled);
+  }
+
   /// @notice Remove a single underlying mapping and disable it on the wrapper atomically.
+  /// @dev Calls wrapper.setUnderlyingEnabledFromFactory(underlying, false) and reverts on failure.
   function removeUnderlyingMapping(address underlying) external onlyRole(OPERATOR_ROLE) {
     address w = wrapperOf[underlying];
     if (w == address(0)) revert NotRegistered();
     if (!isWrapper[w]) revert InvalidParams("not a wrapper");
     if (IDStockWrapper(w).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
-
-    // Disable in wrapper first to ensure on-chain coordination
+    // Disable on wrapper first to ensure coordinated state
     IDStockWrapper(w).setUnderlyingEnabled(underlying, false);
-
-    // Then unmap in registry
+    // Then clear registry mapping
     wrapperOf[underlying] = address(0);
     emit UnderlyingUnmapped(underlying, w);
   }
-
-  // migrateUnderlyings removed by design; migration should be handled explicitly off-chain
 
   // ============================= Views ===========================
 
