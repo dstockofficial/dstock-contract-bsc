@@ -161,6 +161,7 @@ contract DStockWrapper is
     UnderlyingInfo storage info = underlyings[token];
     if (info.decimals == 0) revert UnknownUnderlying();
     if (!info.enabled)      revert UnsupportedUnderlying();
+    if (wrapFeeBps > 0 && treasury == address(0)) revert FeeTreasuryRequired();
 
     _checkCompliance(msg.sender, to, amount, 1 /* Wrap */);
 
@@ -200,6 +201,7 @@ contract DStockWrapper is
     UnderlyingInfo storage info = underlyings[token];
     if (info.decimals == 0) revert UnknownUnderlying();
     if (!info.enabled)      revert UnsupportedUnderlying();
+    if (unwrapFeeBps > 0 && treasury == address(0)) revert FeeTreasuryRequired();
 
     _checkCompliance(msg.sender, to, amount, 2 /* Unwrap */);
 
@@ -266,6 +268,7 @@ contract DStockWrapper is
   function setTreasury(address t) external onlyRole(OPERATOR_ROLE) {
     address old = treasury;
     if (old == t) revert NoChange();
+    if (t == address(0) && (wrapFeeBps > 0 || unwrapFeeBps > 0)) revert FeeTreasuryRequired();
     treasury = t;
     emit TreasuryChanged(old, t);
   }
@@ -428,7 +431,7 @@ contract DStockWrapper is
   function underlyingInfo(address token)
     external
     view
-    returns (bool enabled, uint8 tokenDecimals, uint256 liquidToken)
+    returns (bool isEnabled, uint8 tokenDecimals, uint256 liquidToken)
   {
     UnderlyingInfo memory info = underlyings[token];
     return (info.enabled, info.decimals, IERC20(token).balanceOf(address(this)));
@@ -440,61 +443,19 @@ contract DStockWrapper is
     _addUnderlying(token);
   }
 
-  /// @dev Factory-only to avoid bypassing registry checks (Issue-12)
-  function setUnderlyingEnabled(address token, bool enabled) external {
-    if (msg.sender != factoryRegistry) revert NotAllowed();
+  /// @notice Internal helper used by the factory-only external entrypoint.
+  function _setUnderlyingEnabled(address token, bool enabled) internal {
     UnderlyingInfo storage info = underlyings[token];
     if (info.decimals == 0) revert UnknownUnderlying();
     info.enabled = enabled;
     emit UnderlyingStatusChanged(token, enabled);
   }
 
-  /// @notice Collect surplus liquidity created by holding-fee (multiplier decay) to the treasury.
-  function skimHoldingFees() external onlyRole(OPERATOR_ROLE) nonReentrant updateMultiplier {
-    address dst = treasury;
-    if (dst == address(0)) revert ZeroAddress();
-
-    // Compute required liability and available liquidity (in 18-decimal terms)
-    uint256 required18 = _toAmount(_totalShares);
-    uint256 available18 = 0;
-    uint256 enabledCount = 0;
-    for (uint256 i = 0; i < allUnderlyings.length; i++) {
-      address u = allUnderlyings[i];
-      if (!underlyings[u].enabled) continue;
-      enabledCount += 1;
-      uint256 bal = IERC20(u).balanceOf(address(this));
-      available18 += _normalize(u, bal);
-    }
-    if (available18 <= required18 || enabledCount == 0) return;
-
-    uint256 surplus18 = available18 - required18;
-    uint256 totalSkimmed18 = 0;
-
-    // Distribute proportional skim over enabled underlyings
-    for (uint256 i = 0; i < allUnderlyings.length; i++) {
-      address u = allUnderlyings[i];
-      UnderlyingInfo storage info = underlyings[u];
-      if (!info.enabled) continue;
-
-      uint256 balToken = IERC20(u).balanceOf(address(this));
-      uint256 bal18 = _normalize(u, balToken);
-      uint256 skim18;
-      if (i == allUnderlyings.length - 1) {
-        // last token takes remainder to avoid rounding dust
-        skim18 = surplus18 - totalSkimmed18;
-      } else {
-        skim18 = (surplus18 * bal18) / available18;
-      }
-      if (skim18 == 0) continue;
-      uint256 skimToken = _denormalize(u, skim18);
-      if (skimToken == 0) continue;
-
-      // Transfer skim to treasury; live balances are authoritative
-      IERC20(u).safeTransfer(dst, skimToken);
-      totalSkimmed18 += skim18;
-    }
-
-    emit HoldingFeesSkimmed(surplus18, dst);
+  /// @notice Factory-only external entrypoint to enable/disable an underlying.
+  /// @dev Restricts to exact factoryRegistry to ensure all status changes go via the factory.
+  function setUnderlyingEnabled(address token, bool enabled) external {
+    if (msg.sender != factoryRegistry) revert NotAllowed();
+    _setUnderlyingEnabled(token, enabled);
   }
 
   // ---------- INTERNAL ----------
@@ -634,4 +595,53 @@ contract DStockWrapper is
   
 
   function harvestFees() external { _applyAccruedFee(); }
+
+    /// @notice Collect surplus liquidity created by holding-fee (multiplier decay) to the treasury.
+  function skimHoldingFees() external onlyRole(OPERATOR_ROLE) nonReentrant updateMultiplier {
+    address dst = treasury;
+    if (dst == address(0)) revert ZeroAddress();
+
+    // Compute required liability and available liquidity (in 18-decimal terms)
+    uint256 required18 = _toAmount(_totalShares);
+    uint256 available18 = 0;
+    uint256 enabledCount = 0;
+    for (uint256 i = 0; i < allUnderlyings.length; i++) {
+      address u = allUnderlyings[i];
+      if (!underlyings[u].enabled) continue;
+      enabledCount += 1;
+      uint256 bal = IERC20(u).balanceOf(address(this));
+      available18 += _normalize(u, bal);
+    }
+    if (available18 <= required18 || enabledCount == 0) return;
+
+    uint256 surplus18 = available18 - required18;
+    uint256 totalSkimmed18 = 0;
+
+    // Distribute proportional skim over enabled underlyings
+    for (uint256 i = 0; i < allUnderlyings.length; i++) {
+      address u = allUnderlyings[i];
+      UnderlyingInfo storage info = underlyings[u];
+      if (!info.enabled) continue;
+
+      uint256 balToken = IERC20(u).balanceOf(address(this));
+      uint256 bal18 = _normalize(u, balToken);
+      uint256 skim18;
+      if (i == allUnderlyings.length - 1) {
+        // last token takes remainder to avoid rounding dust
+        skim18 = surplus18 - totalSkimmed18;
+      } else {
+        skim18 = (surplus18 * bal18) / available18;
+      }
+      if (skim18 == 0) continue;
+      uint256 skimToken = _denormalize(u, skim18);
+      if (skimToken == 0) continue;
+
+      // Transfer skim to treasury; live balances are authoritative
+      IERC20(u).safeTransfer(dst, skimToken);
+      totalSkimmed18 += skim18;
+    }
+
+    emit HoldingFeesSkimmed(surplus18, dst);
+  }
 }
+
