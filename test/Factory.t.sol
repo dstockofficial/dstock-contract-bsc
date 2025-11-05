@@ -243,6 +243,148 @@ contract FactoryTest is Test {
   }
 
   // ------------------------------------------------
+  // Multi-wrapper getters and per-wrapper ops
+  // ------------------------------------------------
+  function test_GetWrappers_MultipleAndFirstCompat() public {
+    // first wrapper with U1
+    address[] memory a = new address[](1); a[0] = U1;
+    vm.prank(OP);
+    address w1 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    // second wrapper reuses U1
+    address[] memory b = new address[](1); b[0] = U1;
+    vm.prank(OP);
+    address w2 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: b,
+      name: "d2", symbol: "d2", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    address[] memory ws = factory.getWrappers(U1);
+    assertEq(ws.length, 2, "U1 should have 2 wrappers");
+    // compat getter returns first in list (w1)
+    assertEq(factory.getWrapper(U1), ws[0]);
+    // ensure second exists
+    bool found;
+    for (uint256 i = 0; i < ws.length; i++) if (ws[i] == w2) found = true;
+    assertTrue(found, "second wrapper not in list");
+  }
+
+  function test_SetUnderlyingStatusForWrapper_AffectsTargetOnly() public {
+    // create two wrappers sharing U1
+    address[] memory a = new address[](1); a[0] = U1;
+    vm.prank(OP);
+    address w1 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+    vm.prank(OP);
+    address w2 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d2", symbol: "d2", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    // disable on w1 only
+    vm.prank(OP);
+    factory.setUnderlyingStatusForWrapper(w1, U1, false);
+    (bool e1,,) = IDStockWrapper(w1).underlyingInfo(U1);
+    (bool e2,,) = IDStockWrapper(w2).underlyingInfo(U1);
+    assertTrue(!e1 && e2, "disable should affect only target wrapper");
+  }
+
+  function test_RemoveUnderlyingMappingForWrapper_OnlyRemovesOne() public {
+    address[] memory a = new address[](1); a[0] = U1;
+    vm.prank(OP);
+    address w1 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+    vm.prank(OP);
+    address w2 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d2", symbol: "d2", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    address[] memory before = factory.getWrappers(U1);
+    assertEq(before.length, 2);
+
+    vm.prank(OP);
+    factory.removeUnderlyingMappingForWrapper(w1, U1);
+
+    address[] memory afterList = factory.getWrappers(U1);
+    assertEq(afterList.length, 1, "should remove only one mapping");
+    assertEq(afterList[0], w2, "remaining should be second wrapper");
+    (bool enabled,,) = IDStockWrapper(w1).underlyingInfo(U1);
+    assertTrue(!enabled, "underlying should be disabled on removed wrapper");
+  }
+
+  function test_AddUnderlyings_NoDuplicateMapping() public {
+    // create wrapper with no underlyings then add same token twice
+    address[] memory empty = new address[](0);
+    vm.prank(OP);
+    address w = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: empty,
+      name: "dZ", symbol: "dZ", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    address[] memory tok = new address[](1); tok[0] = U3;
+    vm.prank(OP);
+    factory.addUnderlyings(w, tok);
+    // add same again
+    vm.prank(OP);
+    factory.addUnderlyings(w, tok);
+
+    address[] memory ws = factory.getWrappers(U3);
+    assertEq(ws.length, 1, "no duplicate mapping expected");
+    assertEq(ws[0], w);
+  }
+
+  function test_Deprecate_MarksFlag() public {
+    address[] memory a = new address[](1); a[0] = U1;
+    vm.prank(OP);
+    address w = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+    vm.prank(ADMIN);
+    factory.deprecate(w, "old");
+    assertTrue(factory.deprecated(w));
+    assertEq(factory.deprecateReason(w), "old");
+  }
+
+  function test_SetUnderlyingStatusForWrapper_NotRegistered_Revert() public {
+    address[] memory a = new address[](1); a[0] = U1;
+    vm.prank(OP);
+    address w = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+    vm.prank(OP);
+    vm.expectRevert(DStockFactoryRegistry.NotRegistered.selector);
+    factory.setUnderlyingStatusForWrapper(w, U2, false);
+  }
+
+  // ------------------------------------------------
   // Role grant/revoke affects permissions (createWrapper)
   // ------------------------------------------------
   function test_GrantRevoke_Role_Effect() public {
