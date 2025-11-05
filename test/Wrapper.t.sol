@@ -153,6 +153,28 @@ contract WrapperTest is Test {
     assertEq(wrapper.balanceOf(ALICE), 1 ether);
   }
 
+  function test_WrapUnwrapPause_TransferStillWorks() public {
+    // mint some to ALICE first
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 5 ether, ALICE);
+    // pause only wrap/unwrap
+    vm.prank(ADMIN);
+    wrapper.setWrapUnwrapPaused(true);
+    // wrap should revert with WrapUnwrapPaused
+    vm.prank(ALICE);
+    vm.expectRevert(DStockWrapper.WrapUnwrapPaused.selector);
+    wrapper.wrap(address(usdc), 1 ether, ALICE);
+    // transfer should still work
+    vm.prank(ALICE);
+    wrapper.transfer(BOB, 1 ether);
+    assertEq(wrapper.balanceOf(BOB), 1 ether);
+    // unpause restores wrap
+    vm.prank(ADMIN);
+    wrapper.setWrapUnwrapPaused(false);
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 1 ether, ALICE);
+  }
+
   // unwrap basic
   function test_Unwrap_Success() public {
     vm.prank(ALICE);
@@ -244,6 +266,52 @@ contract WrapperTest is Test {
     wrapper.harvestAll();
     uint256 treAfter = usdc.balanceOf(TREAS);
     assertGt(treAfter, treBefore, "treasury should receive skimmed tokens");
+  }
+
+  function test_UnderlyingFeeMode1_NoSkimOnHarvest() public {
+    // feeMode = 1 means underlying self-rebases; wrapper should not skim
+    vm.prank(ADMIN);
+    wrapper.setUnderlyingRebaseParams(address(usdc), 1, 1e16, 1 days);
+    // seed state
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 50 ether, ALICE);
+    // accrue
+    vm.warp(block.timestamp + 2 days);
+    uint256 treBefore = usdc.balanceOf(TREAS);
+    vm.prank(ADMIN);
+    wrapper.harvestAll();
+    uint256 treAfter = usdc.balanceOf(TREAS);
+    assertEq(treAfter, treBefore, "no skim expected for feeMode=1");
+  }
+
+  function test_SettleAndSkim_OnWrap_RemovesSurplusFirst() public {
+    // Use wrapper-applied fee so surplus exists
+    vm.prank(ADMIN);
+    wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    // seed and accrue
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 100 ether, ALICE);
+    vm.warp(block.timestamp + 2 days);
+    uint256 treBefore = usdc.balanceOf(TREAS);
+    // This wrap should trigger settle+skim before pricing
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 1 ether, ALICE);
+    uint256 treAfter = usdc.balanceOf(TREAS);
+    assertGt(treAfter, treBefore, "treasury should increase due to pre-wrap skim");
+  }
+
+  function test_SettleAndSkim_OnUnwrap_RemovesSurplusFirst() public {
+    vm.prank(ADMIN);
+    wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 100 ether, ALICE);
+    vm.warp(block.timestamp + 2 days);
+    uint256 treBefore = usdc.balanceOf(TREAS);
+    // This unwrap should also trigger settle+skim first
+    vm.prank(ALICE);
+    wrapper.unwrap(address(usdc), 1 ether, ALICE);
+    uint256 treAfter = usdc.balanceOf(TREAS);
+    assertGt(treAfter, treBefore, "treasury should increase due to pre-unwrap skim");
   }
 
   // applySplit per-underlying
