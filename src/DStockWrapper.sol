@@ -13,10 +13,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IDStockCompliance} from "./interfaces/IDStockCompliance.sol";
 import {IDStockWrapper} from "./interfaces/IDStockWrapper.sol";
 
-/// @title DStockWrapper (multi-underlying, safe decimals rescaling)
-/// @notice Multiple underlyings (e.g. TSLAx/TSLAy/...) can map to ONE d-stock.
-///         Shares × multiplier (Ray=1e18) accounting; BPS fees; holding fee; split; force move.
-///         This version adds safe rescaling for arbitrary token decimals (both <18 and >18).
+/// @title DStockWrapper (multi-underlying, dynamic pool valuation)
+/// @notice Multiple underlyings (e.g. TSLAx/TSLAy/...) map to ONE d-stock.
+///         Shares represent pro-rata claim on the pool. Fees/rebases are handled per-underlying.
+///         Safe rescaling supports arbitrary token decimals (both <18 and >18).
 contract DStockWrapper is
   Initializable,
   ERC20Upgradeable,
@@ -45,6 +45,7 @@ contract DStockWrapper is
   uint256 public cap;                   // 18-decimal cap; 0 => unlimited
   string  public termsURI;              // terms
   bool    public pausedByFactory;       // factory-level pause
+  bool    public wrapUnwrapPaused;      // local pause for wrap/unwrap only
 
   // ---------- TOKEN META ----------
   string private _tokenName;
@@ -53,19 +54,17 @@ contract DStockWrapper is
   // ---------- SHARES + MULTIPLIER ----------
   mapping(address => uint256) internal _shares;
   uint256 internal _totalShares;
-  uint256 public  multiplier;           // Ray; amount = shares * multiplier / RAY
-
-  // ---------- HOLDING FEE ----------
-  uint256 public feePerPeriodRay;       // Ray
-  uint32  public periodLength;          // seconds
-  uint64  public lastTimeFeeApplied;    // ts
-  uint8   public feeModel;              // reserved
 
   // ---------- MULTI-UNDERLYING ----------
   struct UnderlyingInfo {
     bool    enabled;
     uint8   decimals;      // 0 => not initialized
-    uint256 liquidToken;   // tracked redeemable liquidity (token units)
+    // Per-underlying rebase/fee parameters
+    uint8   feeMode;          
+    uint256 feePerPeriodRay;   // Ray
+    uint32  periodLength;      // seconds
+    uint64  lastTimeFeeApplied; // ts
+    uint8   feeModel;          // reserved / type
   }
   mapping(address => UnderlyingInfo) internal underlyings;
   address[] internal allUnderlyings;
@@ -82,15 +81,15 @@ contract DStockWrapper is
   event UnwrapFeeChanged(uint16 oldBps, uint16 newBps);
   event CapChanged(uint256 oldCap, uint256 newCap);
   event TermsURIChanged(string oldURI, string newURI);
-  event MultiplierUpdated(uint256 newMultiplier);
-  event RebaseParamsChanged(uint256 feePerPeriodRay, uint32 periodLength, uint8 feeModel);
-  event SplitApplied(uint256 numerator, uint256 denominator, uint256 oldM, uint256 newM);
   event TokenNameChanged(string oldName, string newName);
   event TokenSymbolChanged(string oldSymbol, string newSymbol);
   event UnderlyingAdded(address indexed token, uint8 decimals);
   event UnderlyingStatusChanged(address indexed token, bool enabled);
   event ForceMovedToTreasury(address indexed from, address indexed treasury, uint256 amount, uint256 shares);
-  event HoldingFeesSkimmed(uint256 surplus18, address indexed treasury);
+  event WrapUnwrapPauseChanged(bool isPaused);
+  event UnderlyingRebaseParamsChanged(address indexed token, uint8 feeMode, uint256 feePerPeriodRay, uint32 periodLength);
+  event UnderlyingHarvested(address indexed token, uint256 periodsApplied, uint64 newAnchorTs);
+  event UnderlyingSettledAndSkimmed(address indexed token, uint256 periodsApplied, uint64 newAnchorTs, uint256 skimToken);
 
   // ---------- ERRORS ----------
   error NotAllowed();
@@ -103,6 +102,7 @@ contract DStockWrapper is
   error InsufficientLiquidity();
   error FeeTreasuryRequired();
   error NoChange();
+  error WrapUnwrapPaused();
 
   // ---------- INITIALIZER ----------
   function initialize(IDStockWrapper.InitParams calldata p) external initializer {
@@ -129,13 +129,6 @@ contract DStockWrapper is
     unwrapFeeBps       = p.unwrapFeeBps;
     cap                = p.cap;
     termsURI           = p.termsURI;
-
-    multiplier         = (p.initialMultiplierRay == 0) ? RAY : p.initialMultiplierRay;
-    feePerPeriodRay    = p.feePerPeriodRay;
-    periodLength       = p.periodLength;
-    feeModel           = p.feeModel;
-    lastTimeFeeApplied = uint64(block.timestamp);
-
     // optional initial underlyings
     for (uint256 i = 0; i < p.initialUnderlyings.length; ++i) {
       _addUnderlying(p.initialUnderlyings[i]);
@@ -155,9 +148,9 @@ contract DStockWrapper is
     external
     nonReentrant
     whenOperational
-    updateMultiplier
     returns (uint256 net18, uint256 mintedShares)
   {
+    if (wrapUnwrapPaused) revert WrapUnwrapPaused();
     UnderlyingInfo storage info = underlyings[token];
     if (info.decimals == 0) revert UnknownUnderlying();
     if (!info.enabled)      revert UnsupportedUnderlying();
@@ -165,23 +158,39 @@ contract DStockWrapper is
 
     _checkCompliance(msg.sender, to, amount, 1 /* Wrap */);
 
+    // Settle + skim all enabled underlyings atomically to avoid timing arbitrage across tokens
+    _settleAndSkimAll();
+
+    // 3) Snapshot pool value before deposit (prevent self-dilution)
+    uint256 availBefore = _poolAvailable18();
+
+    // 4) Pull funds
     uint256 balBefore = IERC20(token).balanceOf(address(this));
     IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
     uint256 received = IERC20(token).balanceOf(address(this)) - balBefore;
 
-    uint256 gross18 = _normalize(token, received);
-    uint256 fee18   = (wrapFeeBps == 0) ? 0 : (gross18 * wrapFeeBps) / 10_000;
-    net18 = gross18 - fee18;
-
-    // move fee to treasury (token units)
-    if (fee18 > 0 && treasury != address(0)) {
-      uint256 feeToken = _denormalize(token, fee18);
-      if (feeToken > 0) IERC20(token).safeTransfer(treasury, feeToken);
+    // 5) Fees and net deposit (compute in token units to avoid double rounding)
+    uint256 feeToken = (wrapFeeBps == 0) ? 0 : (received * wrapFeeBps) / 10_000;
+    uint256 netToken = received - feeToken;
+    if (netToken == 0) revert TooSmall();
+    if (feeToken > 0 && treasury != address(0)) {
+      IERC20(token).safeTransfer(treasury, feeToken);
     }
+    uint256 gross18 = _normalize(token, received);
+    uint256 fee18   = _normalize(token, feeToken);
+    net18 = _normalize(token, netToken);
 
-    uint256 s = _toShares(net18);
+    // 6) Effective contributed value: after settlement factor=1, equals net18
+    uint256 depositEff18 = net18;
+    uint256 s;
+    if (_totalShares == 0) {
+      s = depositEff18;
+    } else {
+      if (availBefore == 0) revert TooSmall();
+      s = (depositEff18 * _totalShares) / availBefore;
+    }
     if (s == 0) revert TooSmall();
-    if (cap != 0 && _toAmount(_totalShares + s) > cap) revert CapExceeded();
+    if (cap != 0 && (availBefore + depositEff18) > cap) revert CapExceeded();
 
     _shares[to] += s;
     _totalShares += s;
@@ -196,8 +205,8 @@ contract DStockWrapper is
     external
     nonReentrant
     whenOperational
-    updateMultiplier
   {
+    if (wrapUnwrapPaused) revert WrapUnwrapPaused();
     UnderlyingInfo storage info = underlyings[token];
     if (info.decimals == 0) revert UnknownUnderlying();
     if (!info.enabled)      revert UnsupportedUnderlying();
@@ -205,11 +214,15 @@ contract DStockWrapper is
 
     _checkCompliance(msg.sender, to, amount, 2 /* Unwrap */);
 
+    // Settle + skim all enabled underlyings atomically to avoid timing arbitrage across tokens
+    _settleAndSkimAll();
     uint256 gross18 = _normalize(token, amount);
 
-    // burn shares (ceil to cover gross18 at current multiplier)
-    uint256 s = _toShares(gross18);
-    if (_toAmount(s) < gross18) s += 1;
+    // Burn shares based on pre-withdraw pool value
+    uint256 totalAvailBefore = _poolAvailable18();
+    if (_totalShares == 0 || totalAvailBefore == 0) revert InsufficientLiquidity();
+    // Burn shares using ceil division to cover gross18 at pre-withdraw valuation
+    uint256 s = (gross18 * _totalShares + (totalAvailBefore - 1)) / totalAvailBefore;
     if (_shares[msg.sender] < s) revert InsufficientShares();
 
     // compute fee/net in token native units to avoid double rounding; protect zero-net
@@ -241,7 +254,6 @@ contract DStockWrapper is
   function _update(address from, address to, uint256 value)
     internal
     override
-    updateMultiplier
     whenOperational
   {
     if (value == 0) return;
@@ -327,42 +339,66 @@ contract DStockWrapper is
     pausedByFactory = p;
   }
 
-  function applySplit(uint256 numerator, uint256 denominator)
-    external
-    onlyRole(OPERATOR_ROLE)
-    updateMultiplier
-  {
-    require(numerator > 0 && denominator > 0, "bad ratio");
-    uint256 oldM = multiplier;
-    uint256 newM = (oldM * numerator) / denominator;
-
-    // If multiplier increases, ensure sufficient available liquidity to cover new liability
-    if (newM > oldM) {
-      uint256 required18 = (_totalShares * (newM > 0 ? newM : 1)) / RAY;
-      uint256 available18 = 0;
-      for (uint256 i = 0; i < allUnderlyings.length; i++) {
-        address u = allUnderlyings[i];
-        if (!underlyings[u].enabled) continue;
-        uint256 bal = IERC20(u).balanceOf(address(this));
-        available18 += _normalize(u, bal);
-      }
-      if (available18 < required18) revert InsufficientLiquidity();
-    }
-    multiplier = newM > 0 ? newM : 1;
-    emit SplitApplied(numerator, denominator, oldM, multiplier);
-    emit MultiplierUpdated(multiplier);
+  /// @notice Pause or unpause only wrapping/unwrapping while keeping transfers operational.
+  function setWrapUnwrapPaused(bool p) external onlyRole(PAUSER_ROLE) {
+    if (wrapUnwrapPaused == p) revert NoChange();
+    wrapUnwrapPaused = p;
+    emit WrapUnwrapPauseChanged(p);
   }
 
-  function setRebaseParams(uint256 _feePerPeriodRay, uint32 _periodLength, uint8 _feeModel)
-    external onlyRole(OPERATOR_ROLE) updateMultiplier
+  /// @notice Apply a split/reverse-split on a specific underlying by adjusting its pool balance.
+  /// @dev If numerator > denominator, pulls additional tokens from treasury; if less, sends surplus to treasury.
+  function applySplit(address token, uint256 numerator, uint256 denominator)
+    external
+    onlyRole(OPERATOR_ROLE)
+    nonReentrant
   {
-    if (feePerPeriodRay == _feePerPeriodRay && periodLength == _periodLength && feeModel == _feeModel) {
+    require(numerator > 0 && denominator > 0, "bad ratio");
+    UnderlyingInfo storage info = underlyings[token];
+    if (info.decimals == 0) revert UnknownUnderlying();
+    if (!info.enabled)      revert UnsupportedUnderlying();
+
+    // Settle + skim all first to avoid timing arbitrage across tokens
+    _settleAndSkimAll();
+
+    uint256 oldBal = IERC20(token).balanceOf(address(this));
+    uint256 targetBal = (oldBal * numerator) / denominator;
+
+    if (targetBal > oldBal) {
+      uint256 add = targetBal - oldBal;
+      address dst = address(this);
+      address src = treasury;
+      if (src == address(0)) revert ZeroAddress();
+      IERC20(token).safeTransferFrom(src, dst, add);
+    } else if (oldBal > targetBal) {
+      uint256 remove = oldBal - targetBal;
+      address dst = treasury;
+      if (dst == address(0)) revert ZeroAddress();
+      IERC20(token).safeTransfer(dst, remove);
+    }
+    // No event reuse; the pool balance itself is authoritative
+  }
+
+  /// @notice Set per-underlying rebase/fee parameters.
+  function setUnderlyingRebaseParams(address token, uint8 _feeMode, uint256 _feePerPeriodRay, uint32 _periodLength)
+    external
+    onlyRole(OPERATOR_ROLE)
+  {
+    UnderlyingInfo storage info = underlyings[token];
+    if (info.decimals == 0) revert UnknownUnderlying();
+    if (info.feeMode == _feeMode && info.feePerPeriodRay == _feePerPeriodRay && info.periodLength == _periodLength) {
       revert NoChange();
     }
-    feePerPeriodRay = _feePerPeriodRay;
-    periodLength    = _periodLength;
-    feeModel        = _feeModel;
-    emit RebaseParamsChanged(_feePerPeriodRay, _periodLength, _feeModel);
+    info.feeMode        = _feeMode;
+    info.feePerPeriodRay = _feePerPeriodRay;
+    info.periodLength    = _periodLength;
+    info.lastTimeFeeApplied = uint64(block.timestamp);
+    emit UnderlyingRebaseParamsChanged(token, _feeMode, _feePerPeriodRay, _periodLength);
+  }
+
+  /// @notice Harvest and skim across all enabled underlyings.
+  function harvestAll() external onlyRole(OPERATOR_ROLE) nonReentrant {
+    _settleAndSkimAll();
   }
 
   /// @notice Optional enforcement path: move amount(18) from `from` to `treasury` at shares layer.
@@ -370,7 +406,6 @@ contract DStockWrapper is
     external
     onlyRole(OPERATOR_ROLE)
     nonReentrant
-    updateMultiplier
   {
     address dst = treasury;
     if (dst == address(0)) revert ZeroAddress();
@@ -415,10 +450,6 @@ contract DStockWrapper is
     released18 = gross18 - fee18;
   }
 
-  function getCurrentMultiplier() external view returns (uint256 newMultiplier, uint256 periodsElapsed) {
-    (newMultiplier, periodsElapsed) = _previewApplyAccruedFee(multiplier, lastTimeFeeApplied);
-  }
-
   // multi-underlying views/admin
   function isUnderlyingEnabled(address token) external view returns (bool) {
     return underlyings[token].enabled;
@@ -434,7 +465,12 @@ contract DStockWrapper is
     returns (bool isEnabled, uint8 tokenDecimals, uint256 liquidToken)
   {
     UnderlyingInfo memory info = underlyings[token];
-    return (info.enabled, info.decimals, IERC20(token).balanceOf(address(this)));
+    if (info.decimals == 0) return (false, 0, 0);
+    // Effective liquid token = balanceOf * underlyingMultiplier (Ray)
+    uint256 bal = IERC20(token).balanceOf(address(this));
+    (uint256 m, ) = _previewUnderlyingMultiplierView(info);
+    uint256 effective = (bal * m) / RAY;
+    return (info.enabled, info.decimals, effective);
   }
 
   /// @dev Factory-only to preserve registry invariant: one underlying -> one wrapper (Issue-12)
@@ -458,11 +494,6 @@ contract DStockWrapper is
     _setUnderlyingEnabled(token, enabled);
   }
 
-  // ---------- INTERNAL ----------
-  modifier updateMultiplier() {
-    _applyAccruedFee();
-    _;
-  }
 
   /// @dev Business gating: both OZ pause and factory pause must be false.
   modifier whenOperational() {
@@ -470,28 +501,115 @@ contract DStockWrapper is
     _;
   }
 
-  
+  // Dynamic pool valuation helpers
+  function _poolAvailable18() internal view returns (uint256 total18) {
+    for (uint256 i = 0; i < allUnderlyings.length; i++) {
+      address u = allUnderlyings[i];
+      if (!underlyings[u].enabled) continue;
+      total18 += _underlyingEffective18(u);
+    }
+  }
 
   function _toShares(uint256 amount18) internal view returns (uint256) {
-    return (amount18 == 0) ? 0 : (amount18 * RAY) / multiplier;
+    if (amount18 == 0) return 0;
+    if (_totalShares == 0) return amount18;
+    uint256 avail18 = _poolAvailable18();
+    if (avail18 == 0) return 0;
+    return (amount18 * _totalShares) / avail18;
   }
 
   function _toAmount(uint256 shares) internal view returns (uint256) {
-    return (shares == 0) ? 0 : (shares * multiplier) / RAY;
-  }
-
-  // View-only helpers using preview multiplier (fresh as of now)
-  function _currentMultiplierView() internal view returns (uint256 m) {
-    (m, ) = _previewApplyAccruedFee(multiplier, lastTimeFeeApplied);
+    if (shares == 0) return 0;
+    if (_totalShares == 0) return 0;
+    uint256 avail18 = _poolAvailable18();
+    return (shares * avail18) / _totalShares;
   }
 
   function _toAmountView(uint256 shares) internal view returns (uint256) {
     if (shares == 0) return 0;
-    uint256 m = _currentMultiplierView();
-    return (shares * m) / RAY;
+    if (_totalShares == 0) return 0;
+    uint256 avail18 = _poolAvailable18();
+    return (shares * avail18) / _totalShares;
   }
 
-  // ======== SAFE RESCALING (supports decimals > 18) ========
+  // Atomic per-underlying settlement + surplus skim
+  function _settleAndSkimUnderlying(address token) internal {
+    address dst = treasury;
+    UnderlyingInfo storage infoStore = underlyings[token];
+    if (infoStore.decimals == 0 || !infoStore.enabled) return;
+
+    // Snapshot info for pre-harvest factor
+    UnderlyingInfo memory info = infoStore;
+
+    uint256 skimToken = 0;
+    if (dst != address(0)) {
+      uint256 balToken = IERC20(token).balanceOf(address(this));
+      if (balToken > 0) {
+        uint256 raw18 = _normalize(token, balToken);
+        (uint256 m, ) = _previewUnderlyingMultiplierView(info);
+        uint256 eff18 = (raw18 * m) / RAY;
+        if (raw18 > eff18) {
+          uint256 surplus18 = raw18 - eff18;
+          skimToken = _denormalize(token, surplus18);
+          if (skimToken > 0) {
+            IERC20(token).safeTransfer(dst, skimToken);
+          }
+        }
+      }
+    }
+
+    // Advance anchor after computing skim with pre-harvest factor
+    if (info.feeMode != 1 && info.periodLength != 0 && info.feePerPeriodRay != 0 && block.timestamp > info.lastTimeFeeApplied) {
+      uint256 elapsed = block.timestamp - info.lastTimeFeeApplied;
+      uint256 periods = elapsed / info.periodLength;
+      if (periods > 0) {
+        uint64 newAnchor = uint64(block.timestamp - (elapsed % info.periodLength));
+        infoStore.lastTimeFeeApplied = newAnchor;
+        emit UnderlyingHarvested(token, periods, newAnchor);
+        emit UnderlyingSettledAndSkimmed(token, periods, newAnchor, skimToken);
+        return;
+      }
+    }
+    if (skimToken > 0) {
+      emit UnderlyingSettledAndSkimmed(token, 0, infoStore.lastTimeFeeApplied, skimToken);
+    }
+  }
+
+  // Settle + skim across all enabled underlyings
+  function _settleAndSkimAll() internal {
+    for (uint256 i = 0; i < allUnderlyings.length; i++) {
+      address u = allUnderlyings[i];
+      if (!underlyings[u].enabled) continue;
+      _settleAndSkimUnderlying(u);
+    }
+  }
+
+  // ======== PER-UNDERLYING MULTIPLIER (effective liquidity factor) ========
+  function _previewUnderlyingMultiplierView(UnderlyingInfo memory info)
+    internal
+    view
+    returns (uint256 newM, uint256 periods)
+  {
+    // feeMode == 1 => underlying self-rebases/charges; use raw balance (multiplier=1)
+    if (info.feeMode == 1) return (RAY, 0);
+    if (info.periodLength == 0 || info.feePerPeriodRay == 0) return (RAY, 0);
+    if (block.timestamp <= info.lastTimeFeeApplied) return (RAY, 0);
+    uint256 elapsed = block.timestamp - info.lastTimeFeeApplied;
+    periods = elapsed / info.periodLength;
+    if (periods == 0) return (RAY, 0);
+    uint256 factor = _rayPow(RAY - info.feePerPeriodRay, periods);
+    newM = factor; // relative to 1.0 Ray baseline
+  }
+
+  function _underlyingEffective18(address token) internal view returns (uint256 effective18) {
+    UnderlyingInfo memory info = underlyings[token];
+    if (info.decimals == 0 || !info.enabled) return 0;
+    uint256 balToken = IERC20(token).balanceOf(address(this));
+    uint256 bal18 = _normalize(token, balToken);
+    (uint256 m, ) = _previewUnderlyingMultiplierView(info);
+    // feeMode==1 => m=1, equals raw balance; otherwise apply decay factor
+    effective18 = (bal18 * m) / RAY;
+  }
 
   /// @dev 10^k with small k (loop), used in segmented scaling to avoid overflow.
   function _pow10(uint8 k) internal pure returns (uint256 r) {
@@ -549,27 +667,6 @@ contract DStockWrapper is
     }
   }
 
-  // lazy holding-fee: m *= (1 - f)^n
-  function _applyAccruedFee() internal {
-    (uint256 m, uint256 periods) = _previewApplyAccruedFee(multiplier, lastTimeFeeApplied);
-    if (periods == 0) return;
-    multiplier = m > 0 ? m : 1;
-    lastTimeFeeApplied = uint64(block.timestamp - ((block.timestamp - lastTimeFeeApplied) % periodLength));
-    emit MultiplierUpdated(multiplier);
-  }
-
-  function _previewApplyAccruedFee(uint256 m, uint256 lastTs) internal view returns (uint256 newM, uint256 periods) {
-    if (periodLength == 0 || feePerPeriodRay == 0) return (m, 0);
-    if (block.timestamp <= lastTs) return (m, 0);
-
-    uint256 elapsed = block.timestamp - lastTs;
-    periods = elapsed / periodLength;
-    if (periods == 0) return (m, 0);
-
-    uint256 factor = _rayPow(RAY - feePerPeriodRay, periods);
-    newM = (m * factor) / RAY;
-  }
-
   function _rayPow(uint256 baseRay, uint256 exp) internal pure returns (uint256) {
     uint256 result = RAY;
     while (exp > 0) {
@@ -587,61 +684,12 @@ contract DStockWrapper is
     uint8 dec = IERC20Metadata(token).decimals(); // no limit now; we rescale safely both ways
     info.decimals    = dec;
     info.enabled     = true;
-    info.liquidToken = 0;
+    info.feeMode        = 1; // default: assume underlying self-rebases/charges
+    info.feePerPeriodRay = 0;
+    info.periodLength    = 0;
+    info.lastTimeFeeApplied = uint64(block.timestamp);
     allUnderlyings.push(token);
     emit UnderlyingAdded(token, dec);
-  }
-
-  
-
-  function harvestFees() external { _applyAccruedFee(); }
-
-    /// @notice Collect surplus liquidity created by holding-fee (multiplier decay) to the treasury.
-  function skimHoldingFees() external onlyRole(OPERATOR_ROLE) nonReentrant updateMultiplier {
-    address dst = treasury;
-    if (dst == address(0)) revert ZeroAddress();
-
-    // Compute required liability and available liquidity (in 18-decimal terms)
-    uint256 required18 = _toAmount(_totalShares);
-    uint256 available18 = 0;
-    uint256 enabledCount = 0;
-    for (uint256 i = 0; i < allUnderlyings.length; i++) {
-      address u = allUnderlyings[i];
-      if (!underlyings[u].enabled) continue;
-      enabledCount += 1;
-      uint256 bal = IERC20(u).balanceOf(address(this));
-      available18 += _normalize(u, bal);
-    }
-    if (available18 <= required18 || enabledCount == 0) return;
-
-    uint256 surplus18 = available18 - required18;
-    uint256 totalSkimmed18 = 0;
-
-    // Distribute proportional skim over enabled underlyings
-    for (uint256 i = 0; i < allUnderlyings.length; i++) {
-      address u = allUnderlyings[i];
-      UnderlyingInfo storage info = underlyings[u];
-      if (!info.enabled) continue;
-
-      uint256 balToken = IERC20(u).balanceOf(address(this));
-      uint256 bal18 = _normalize(u, balToken);
-      uint256 skim18;
-      if (i == allUnderlyings.length - 1) {
-        // last token takes remainder to avoid rounding dust
-        skim18 = surplus18 - totalSkimmed18;
-      } else {
-        skim18 = (surplus18 * bal18) / available18;
-      }
-      if (skim18 == 0) continue;
-      uint256 skimToken = _denormalize(u, skim18);
-      if (skimToken == 0) continue;
-
-      // Transfer skim to treasury; live balances are authoritative
-      IERC20(u).safeTransfer(dst, skimToken);
-      totalSkimmed18 += skim18;
-    }
-
-    emit HoldingFeesSkimmed(surplus18, dst);
-  }
+  }  
 }
 
