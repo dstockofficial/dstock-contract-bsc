@@ -7,9 +7,9 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 
 import {IDStockWrapper} from "./interfaces/IDStockWrapper.sol";
 
-/// @title DStockFactoryRegistry
-/// @notice Factory + registry; uses a Beacon to point to a single DStockWrapper implementation.
-///         Creating a new wrapper deploys only a BeaconProxy. Supports mapping MANY underlyings to ONE wrapper.
+  /// @title DStockFactoryRegistry
+  /// @notice Factory + registry; Beacon-based DStockWrapper deployments.
+  ///         Supports mapping MANY underlyings to MANY wrappers (an underlying can be wrapped multiple times).
 contract DStockFactoryRegistry is AccessControl {
   // ---------- Roles ----------
   bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
@@ -19,9 +19,11 @@ contract DStockFactoryRegistry is AccessControl {
   UpgradeableBeacon public immutable beacon; // owner = this factory contract
   address public globalCompliance;           // Global compliance module (wrappers can override locally)
 
-  // ---------- Registry (multi-underlying) ----------
-  // underlying token => wrapper
-  mapping(address => address) public wrapperOf;
+  // ---------- Registry (multi-underlying, multi-wrapper) ----------
+  // underlying token => list of wrappers that include it
+  mapping(address => address[]) public wrappersOf;
+  // fast membership check: underlying => (wrapper => true/false)
+  mapping(address => mapping(address => bool)) public isUnderlyingMappedToWrapper;
 
   // wrapper bookkeeping
   mapping(address => bool) public isWrapper;
@@ -76,7 +78,7 @@ contract DStockFactoryRegistry is AccessControl {
 
   // ============================ Create ============================
 
-  /// @notice Create a new DStockWrapper (BeaconProxy) and map all initial underlyings to it.
+  /// @notice Create a new DStockWrapper (BeaconProxy) and map initial underlyings to it.
   /// @dev The proxy is deployed; logic is shared via the Beacon; initialization uses InitParams struct.
   ///      `p.initialUnderlyings` may be empty (wrapper can add later), but if non-empty, each must be unused.
   function createWrapper(IDStockWrapper.InitParams calldata p)
@@ -94,12 +96,11 @@ contract DStockFactoryRegistry is AccessControl {
     // Inject back-pointer to factory
     _p.factoryRegistry = address(this);
 
-    // Validate initial underlyings (no duplicates, none already mapped)
+    // Validate initial underlyings (no zero address; allow multiple wrappers per underlying)
     if (_p.initialUnderlyings.length > 0) {
       for (uint256 i = 0; i < _p.initialUnderlyings.length; i++) {
         address u = _p.initialUnderlyings[i];
         if (u == address(0)) revert ZeroAddress();
-        if (wrapperOf[u] != address(0)) revert AlreadyRegistered(); // already mapped elsewhere
       }
     }
 
@@ -113,11 +114,14 @@ contract DStockFactoryRegistry is AccessControl {
     allWrappers.push(wrapper);
     emit WrapperCreated(wrapper, _p.name, _p.symbol);
 
-    // Map each initial underlying -> wrapper
+    // Map each initial underlying -> wrapper (allow multiple wrappers per underlying)
     for (uint256 i = 0; i < _p.initialUnderlyings.length; i++) {
       address u = _p.initialUnderlyings[i];
-      wrapperOf[u] = wrapper;
-      emit UnderlyingMapped(u, wrapper);
+      if (!isUnderlyingMappedToWrapper[u][wrapper]) {
+        wrappersOf[u].push(wrapper);
+        isUnderlyingMappedToWrapper[u][wrapper] = true;
+        emit UnderlyingMapped(u, wrapper);
+      }
     }
   }
 
@@ -173,11 +177,10 @@ contract DStockFactoryRegistry is AccessControl {
     if (IDStockWrapper(wrapper).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
     if (tokens.length == 0) revert InvalidParams("empty tokens");
 
-    // Validate and ensure no conflicts before mutating state
+    // Validate input (allow multiple wrappers per token)
     for (uint256 i = 0; i < tokens.length; i++) {
       address u = tokens[i];
       if (u == address(0)) revert ZeroAddress();
-      if (wrapperOf[u] != address(0)) revert AlreadyRegistered();
     }
 
     // For each token: if already present (decimals != 0) then re-enable; else add new
@@ -189,46 +192,68 @@ contract DStockFactoryRegistry is AccessControl {
       } else if (!isEnabled) {
         IDStockWrapper(wrapper).setUnderlyingEnabled(u, true);
       } else {
-        // already present and enabled in wrapper but not mapped -> inconsistent state
-        revert InvalidParams("token already enabled in wrapper");
+        // already present and enabled in wrapper; proceed to ensure registry mapping exists/updated
       }
-      wrapperOf[u] = wrapper;
-      emit UnderlyingMapped(u, wrapper);
+      if (!isUnderlyingMappedToWrapper[u][wrapper]) {
+        wrappersOf[u].push(wrapper);
+        isUnderlyingMappedToWrapper[u][wrapper] = true;
+        emit UnderlyingMapped(u, wrapper);
+      }
     }
 
     emit UnderlyingsAdded(wrapper, tokens);
   }
 
-  /// @notice Set only the enabled status of an existing underlying without changing mapping.
+  /// @notice Set only the enabled status of an existing underlying for a specific wrapper.
   /// @dev All status changes go through factory; wrapper emits UnderlyingStatusChanged.
-  function setUnderlyingStatus(address underlying, bool enabled)
+  function setUnderlyingStatusForWrapper(address wrapper, address underlying, bool enabled)
     external
     onlyRole(OPERATOR_ROLE)
   {
-    address w = wrapperOf[underlying];
-    if (w == address(0)) revert NotRegistered();
-    if (IDStockWrapper(w).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
-    IDStockWrapper(w).setUnderlyingEnabled(underlying, enabled);
+    if (!isWrapper[wrapper]) revert NotRegistered();
+    if (!isUnderlyingMappedToWrapper[underlying][wrapper]) revert NotRegistered();
+    if (IDStockWrapper(wrapper).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
+    IDStockWrapper(wrapper).setUnderlyingEnabled(underlying, enabled);
   }
 
-  /// @notice Remove a single underlying mapping and disable it on the wrapper atomically.
-  /// @dev Calls wrapper.setUnderlyingEnabledFromFactory(underlying, false) and reverts on failure.
-  function removeUnderlyingMapping(address underlying) external onlyRole(OPERATOR_ROLE) {
-    address w = wrapperOf[underlying];
-    if (w == address(0)) revert NotRegistered();
-    if (!isWrapper[w]) revert InvalidParams("not a wrapper");
-    if (IDStockWrapper(w).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
+  /// @notice Remove a single underlying mapping for a specific wrapper and disable it on that wrapper atomically.
+  function removeUnderlyingMappingForWrapper(address wrapper, address underlying) external onlyRole(OPERATOR_ROLE) {
+    if (!isWrapper[wrapper]) revert NotRegistered();
+    if (!isUnderlyingMappedToWrapper[underlying][wrapper]) revert NotRegistered();
+    if (IDStockWrapper(wrapper).factoryRegistry() != address(this)) revert InvalidParams("foreign wrapper");
     // Disable on wrapper first to ensure coordinated state
-    IDStockWrapper(w).setUnderlyingEnabled(underlying, false);
-    // Then clear registry mapping
-    wrapperOf[underlying] = address(0);
-    emit UnderlyingUnmapped(underlying, w);
+    IDStockWrapper(wrapper).setUnderlyingEnabled(underlying, false);
+    // Then clear registry mapping entry
+    _removeWrapperFromUnderlyingList(underlying, wrapper);
+    emit UnderlyingUnmapped(underlying, wrapper);
   }
 
   // ============================= Views ===========================
 
+  /// @notice Backward-compat single wrapper getter: returns the first wrapper if any (may be 0x0 if none)
   function getWrapper(address underlying) external view returns (address) {
-    return wrapperOf[underlying];
+    address[] memory list = wrappersOf[underlying];
+    return (list.length == 0) ? address(0) : list[0];
+  }
+
+  /// @notice Get all wrappers that include a specific underlying
+  function getWrappers(address underlying) external view returns (address[] memory) {
+    return wrappersOf[underlying];
+  }
+
+  /// @dev Internal helper to remove a wrapper from the wrappersOf list and clear membership flag
+  function _removeWrapperFromUnderlyingList(address underlying, address wrapper) internal {
+    address[] storage arr = wrappersOf[underlying];
+    uint256 n = arr.length;
+    for (uint256 i = 0; i < n; i++) {
+      if (arr[i] == wrapper) {
+        // swap and pop
+        if (i != n - 1) arr[i] = arr[n - 1];
+        arr.pop();
+        break;
+      }
+    }
+    isUnderlyingMappedToWrapper[underlying][wrapper] = false;
   }
 
   function countWrappers() external view returns (uint256) {
