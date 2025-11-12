@@ -389,6 +389,9 @@ contract DStockWrapper is
     if (info.feeMode == _feeMode && info.feePerPeriodRay == _feePerPeriodRay && info.periodLength == _periodLength) {
       revert NoChange();
     }
+    // Harvest/settle pending fees for this underlying before changing parameters
+    // to avoid dropping accrual between the old anchor and now.
+    _settleAndSkimUnderlying(token);
     info.feeMode        = _feeMode;
     info.feePerPeriodRay = _feePerPeriodRay;
     info.periodLength    = _periodLength;

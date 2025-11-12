@@ -314,6 +314,24 @@ contract WrapperTest is Test {
     assertGt(treAfter, treBefore, "treasury should increase due to pre-unwrap skim");
   }
 
+  // setUnderlyingRebaseParams should harvest pending fees before updating params
+  function test_SetUnderlyingRebaseParams_HarvestsBeforeUpdate() public {
+    // Enable wrapper-applied fee accrual
+    vm.prank(ADMIN);
+    wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    // Seed pool
+    vm.prank(ALICE);
+    wrapper.wrap(address(usdc), 100 ether, ALICE);
+    // Accrue more than one full period
+    vm.warp(block.timestamp + 2 days);
+    uint256 treBefore = usdc.balanceOf(TREAS);
+    // Updating params should internally settle+skim first, increasing treasury
+    vm.prank(ADMIN);
+    wrapper.setUnderlyingRebaseParams(address(usdc), 0, 2e16, 1 days);
+    uint256 treAfter = usdc.balanceOf(TREAS);
+    assertGt(treAfter, treBefore, "treasury should increase due to pre-update harvest");
+  }
+
   // applySplit per-underlying
   function test_ApplySplit_PerUnderlying_Authorized_And_Unauthorized() public {
     // Seed pool with tokens via wrap
