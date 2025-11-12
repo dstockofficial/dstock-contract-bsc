@@ -48,8 +48,9 @@ contract WrapperTest is Test {
     });
     comp.setFlagsGlobal(g);
 
-    // give KYC to ALICE only (BOB no KYC initially)
+    // give KYC to ALICE and ADMIN (BOB no KYC initially)
     comp.setKyc(ALICE, true);
+    comp.setKyc(ADMIN, true);
     vm.stopPrank();
 
     // 2) wrapper via BeaconProxy: use initialUnderlyings
@@ -94,6 +95,14 @@ contract WrapperTest is Test {
 
   // wrap basic
   function test_Wrap_Success() public {
+    // First wrap must be done by OPERATOR_ROLE with minimum 1e18
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 100 ether, ADMIN); // initial wrap by operator
+    vm.stopPrank();
+
+    // Now regular users can wrap
     uint256 beforeU = usdc.balanceOf(ALICE);
     vm.prank(ALICE);
     (uint256 net, uint256 s) = wrapper.wrap(address(usdc), 100 ether, ALICE);
@@ -113,7 +122,11 @@ contract WrapperTest is Test {
   }
 
   function test_Wrap_Fail_ToMustBeCustody_WhenFlagOn() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
     vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     DStockCompliance.Flags memory t = comp.getFlags(address(wrapper));
     t.wrapToCustodyOnly = true;
     comp.setFlagsForToken(address(wrapper), t);
@@ -133,6 +146,13 @@ contract WrapperTest is Test {
   }
 
   function test_Wrap_Fail_InsufficientAllowance() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
+
     vm.prank(ALICE);
     usdc.approve(address(wrapper), 0);
     vm.prank(ALICE);
@@ -141,6 +161,13 @@ contract WrapperTest is Test {
   }
 
   function test_Wrap_Fail_Paused() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
+
     vm.prank(ADMIN);
     wrapper.pause();
     vm.prank(ALICE);
@@ -153,7 +180,61 @@ contract WrapperTest is Test {
     assertEq(wrapper.balanceOf(ALICE), 1 ether);
   }
 
+  // First wrap restrictions
+  function test_FirstWrap_RequiresOperatorRole() public {
+    usdc.mint(ALICE, 100 ether);
+    vm.prank(ALICE);
+    vm.expectRevert(DStockWrapper.NotAllowed.selector);
+    wrapper.wrap(address(usdc), 1e18, ALICE); // ALICE doesn't have OPERATOR_ROLE
+  }
+
+  function test_FirstWrap_RequiresMinimumAmount() public {
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    // Try with amount less than 1e18 (after fee)
+    vm.expectRevert(DStockWrapper.TooSmall.selector);
+    wrapper.wrap(address(usdc), 0.5 ether, ADMIN); // less than 1e18
+    vm.stopPrank();
+  }
+
+  function test_FirstWrap_OperatorWithMinimumAmount_Success() public {
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    (uint256 net, uint256 s) = wrapper.wrap(address(usdc), 10 ether, ADMIN); // >= 1e18
+    assertEq(net, 10 ether, "net should be 10 ether");
+    assertEq(s, 10 ether, "shares should be 10 ether");
+    assertEq(wrapper.balanceOf(ADMIN), 10 ether, "ADMIN should have 10 ether shares");
+    vm.stopPrank();
+  }
+
+  function test_AfterFirstWrap_RegularUsersCanWrap() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
+
+    // Now regular user can wrap
+    uint256 beforeU = usdc.balanceOf(ALICE);
+    vm.prank(ALICE);
+    (uint256 net, uint256 s) = wrapper.wrap(address(usdc), 5 ether, ALICE);
+    assertEq(usdc.balanceOf(ALICE), beforeU - 5 ether, "underlying not moved");
+    assertEq(net, 5 ether, "net mismatch");
+    assertEq(s, 5 ether, "shares minted mismatch");
+    assertEq(wrapper.balanceOf(ALICE), 5 ether, "wrapper balance mismatch");
+  }
+
   function test_WrapUnwrapPause_TransferStillWorks() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
+
     // mint some to ALICE first
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 5 ether, ALICE);
@@ -177,6 +258,12 @@ contract WrapperTest is Test {
 
   // unwrap basic
   function test_Unwrap_Success() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 10 ether, ALICE);
     uint256 beforeU = usdc.balanceOf(ALICE);
@@ -187,7 +274,11 @@ contract WrapperTest is Test {
   }
 
   function test_Unwrap_Fail_KycOnUnwrap_From() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
     vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     comp.setKyc(BOB, true);
     vm.stopPrank();
     usdc.mint(BOB, 10 ether);
@@ -203,6 +294,12 @@ contract WrapperTest is Test {
   }
 
   function test_Unwrap_Fail_FromMustBeCustody_WhenFlagOn() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 100 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 3 ether, ALICE);
     vm.startPrank(ADMIN);
@@ -249,9 +346,14 @@ contract WrapperTest is Test {
 
   // per-underlying rebase params + harvest
   function test_UnderlyingRebaseParams_And_HarvestAll() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     // Operator sets per-underlying rebase params: feeMode=0 (wrapper-applied), 1%/day
-    vm.prank(ADMIN);
     wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    vm.stopPrank();
 
     // Have some state
     vm.prank(ALICE);
@@ -269,9 +371,14 @@ contract WrapperTest is Test {
   }
 
   function test_UnderlyingFeeMode1_NoSkimOnHarvest() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     // feeMode = 1 means underlying self-rebases; wrapper should not skim
-    vm.prank(ADMIN);
     wrapper.setUnderlyingRebaseParams(address(usdc), 1, 1e16, 1 days);
+    vm.stopPrank();
     // seed state
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 50 ether, ALICE);
@@ -285,9 +392,14 @@ contract WrapperTest is Test {
   }
 
   function test_SettleAndSkim_OnWrap_RemovesSurplusFirst() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     // Use wrapper-applied fee so surplus exists
-    vm.prank(ADMIN);
     wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    vm.stopPrank();
     // seed and accrue
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 100 ether, ALICE);
@@ -301,8 +413,13 @@ contract WrapperTest is Test {
   }
 
   function test_SettleAndSkim_OnUnwrap_RemovesSurplusFirst() public {
-    vm.prank(ADMIN);
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    vm.stopPrank();
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 100 ether, ALICE);
     vm.warp(block.timestamp + 2 days);
@@ -316,9 +433,14 @@ contract WrapperTest is Test {
 
   // setUnderlyingRebaseParams should harvest pending fees before updating params
   function test_SetUnderlyingRebaseParams_HarvestsBeforeUpdate() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     // Enable wrapper-applied fee accrual
-    vm.prank(ADMIN);
     wrapper.setUnderlyingRebaseParams(address(usdc), 0, 1e16, 1 days);
+    vm.stopPrank();
     // Seed pool
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 100 ether, ALICE);
@@ -334,6 +456,12 @@ contract WrapperTest is Test {
 
   // applySplit per-underlying
   function test_ApplySplit_PerUnderlying_Authorized_And_Unauthorized() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
     // Seed pool with tokens via wrap
     vm.prank(ALICE);
     wrapper.wrap(address(usdc), 100 ether, ALICE);
@@ -358,9 +486,17 @@ contract WrapperTest is Test {
 
   // multi-underlying add/disable
   function test_AddUnderlying_Authorized_Success_WrapUnwrap_OK() public {
+    // First wrap by operator for usdc
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
     MockERC20 usdc2 = new MockERC20("USDC2","USDC2");
-    vm.prank(ADMIN);
     wrapper.addUnderlying(address(usdc2));
+    usdc2.mint(ADMIN, 1000 ether);
+    usdc2.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc2), 10 ether, ADMIN); // First wrap for usdc2
+    vm.stopPrank();
     usdc2.mint(ALICE, 1_000 ether);
     vm.startPrank(ALICE);
     usdc2.approve(address(wrapper), type(uint256).max);
@@ -389,6 +525,12 @@ contract WrapperTest is Test {
   }
 
   function test_DisableUnderlying_Authorized_Then_WrapUnwrap_Fail() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
     vm.startPrank(ALICE);
     wrapper.wrap(address(usdc), 50 ether, ALICE);
     vm.stopPrank();
@@ -405,6 +547,12 @@ contract WrapperTest is Test {
   }
 
   function test_DisableUnderlying_Unauthorized_NoEffect_WrapStillOK() public {
+    // First wrap by operator
+    usdc.mint(ADMIN, 1000 ether);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10 ether, ADMIN);
+    vm.stopPrank();
     vm.prank(STRANG);
     vm.expectRevert();
     wrapper.setUnderlyingEnabled(address(usdc), false);

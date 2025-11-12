@@ -67,6 +67,13 @@ contract WrapperForceMoveTest is Test {
     bytes memory initData = abi.encodeWithSelector(DStockWrapper.initialize.selector, p);
     wrapper = DStockWrapper(address(new BeaconProxy(address(beacon), initData)));
 
+    // First wrap must be done by OPERATOR_ROLE (ADMIN) with minimum deposit
+    usdc.mint(ADMIN, 1000e18);
+    vm.startPrank(ADMIN);
+    usdc.approve(address(wrapper), type(uint256).max);
+    wrapper.wrap(address(usdc), 10e18, ADMIN); // initial wrap by operator
+    vm.stopPrank();
+
     // approve + wrap some to ALICE so she holds shares
     vm.startPrank(ALICE);
     usdc.approve(address(wrapper), type(uint256).max);

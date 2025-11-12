@@ -43,6 +43,7 @@ contract DStockWrapper is
   uint16  public wrapFeeBps;            // 0 ok
   uint16  public unwrapFeeBps;          // 0 ok
   uint256 public cap;                   // 18-decimal cap; 0 => unlimited
+  uint256 public minInitialDeposit18;    // minimum initial deposit in 18-decimal terms; default 1e18
   string  public termsURI;              // terms
   bool    public pausedByFactory;       // factory-level pause
   bool    public wrapUnwrapPaused;      // local pause for wrap/unwrap only
@@ -80,6 +81,7 @@ contract DStockWrapper is
   event WrapFeeChanged(uint16 oldBps, uint16 newBps);
   event UnwrapFeeChanged(uint16 oldBps, uint16 newBps);
   event CapChanged(uint256 oldCap, uint256 newCap);
+  event MinInitialDepositChanged(uint256 oldMin, uint256 newMin);
   event TermsURIChanged(string oldURI, string newURI);
   event TokenNameChanged(string oldName, string newName);
   event TokenSymbolChanged(string oldSymbol, string newSymbol);
@@ -128,6 +130,7 @@ contract DStockWrapper is
     wrapFeeBps         = p.wrapFeeBps;
     unwrapFeeBps       = p.unwrapFeeBps;
     cap                = p.cap;
+    minInitialDeposit18 = 1e18; // default minimum initial deposit
     termsURI           = p.termsURI;
     // optional initial underlyings
     for (uint256 i = 0; i < p.initialUnderlyings.length; ++i) {
@@ -184,6 +187,9 @@ contract DStockWrapper is
     uint256 depositEff18 = net18;
     uint256 s;
     if (_totalShares == 0) {
+      // First wrap: only OPERATOR_ROLE allowed, minimum deposit required
+      if (!hasRole(OPERATOR_ROLE, msg.sender)) revert NotAllowed();
+      if (depositEff18 < minInitialDeposit18) revert TooSmall(); // require minimum deposit for initial wrap
       s = depositEff18;
     } else {
       if (availBefore == 0) revert TooSmall();
@@ -306,6 +312,13 @@ contract DStockWrapper is
     if (old == newCap) revert NoChange();
     cap = newCap;
     emit CapChanged(old, newCap);
+  }
+
+  function setMinInitialDeposit(uint256 newMin) external onlyRole(OPERATOR_ROLE) {
+    uint256 old = minInitialDeposit18;
+    if (old == newMin) revert NoChange();
+    minInitialDeposit18 = newMin;
+    emit MinInitialDepositChanged(old, newMin);
   }
 
   function setTermsURI(string calldata uri) external onlyRole(OPERATOR_ROLE) {
