@@ -33,10 +33,14 @@ interface IDStockWrapper {
   // ---- lifecycle (factory uses this) ----
   function initialize(InitParams calldata p) external;
   function setPausedByFactory(bool paused) external;
+  function factoryRegistry() external view returns (address);
 
   // ---- multi-underlying admin (optional for factory; used by ops) ----
   function addUnderlying(address token) external;
   function setUnderlyingEnabled(address token, bool enabled) external;
+
+  // ---- fees ops ----
+  function skimHoldingFees() external;
 
   // ---- multi-underlying business (frontends/scripts will call these) ----
   /// @notice Wrap exact `amount` of `token` into the unified d-stock.
@@ -53,10 +57,10 @@ interface IDStockWrapper {
   function isUnderlyingEnabled(address token) external view returns (bool);
   function listUnderlyings() external view returns (address[] memory);
   /// @return enabled Whether token is enabled
-  /// @return decimals Token decimals (<=18)
+  /// @return tokenDecimals Token decimals (<=18)
   /// @return liquidToken Tracked redeemable liquidity in token units
   function underlyingInfo(address token)
     external
     view
-    returns (bool enabled, uint8 decimals, uint256 liquidToken);
+    returns (bool enabled, uint8 tokenDecimals, uint256 liquidToken);
 }
