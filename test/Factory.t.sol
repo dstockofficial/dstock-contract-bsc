@@ -16,6 +16,11 @@ interface IBeacon {
 // ERC20 mock used as real underlying tokens
 contract MockERC20 is ERC20 {
   constructor(string memory n, string memory s) ERC20(n, s) {}
+
+  /// @dev Mint helper used only in tests.
+  function mint(address to, uint256 amount) external {
+    _mint(to, amount);
+  }
 }
 
 // a dummy wrapper used to test migrate new binding (if you later add migrate tests)
@@ -355,6 +360,49 @@ contract FactoryTest is Test {
     assertEq(ws[0], w);
   }
 
+  // Re-add previously removed underlying and wrap again (audit Issue‑10 suggested testcase)
+  function test_ReAddUnderlyingAfterRemove_CanWrapAgain() public {
+    // 1) Create a wrapper with U1 as initial underlying
+    address[] memory initU = new address[](1);
+    initU[0] = U1;
+    vm.prank(OP);
+    address w = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: initU,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    DStockWrapper dw = DStockWrapper(w);
+
+    // 2) First wrap by ADMIN (OPERATOR_ROLE) to bootstrap initial shares
+    token1.mint(ADMIN, 10 ether);
+    vm.startPrank(ADMIN);
+    token1.approve(w, type(uint256).max);
+    dw.wrap(U1, 1 ether, ADMIN);
+    vm.stopPrank();
+
+    // 3) Remove the mapping between U1 and the wrapper via the factory (also disables it on the wrapper)
+    vm.prank(OP);
+    factory.removeUnderlyingMappingForWrapper(w, U1);
+    (bool enabled,,) = dw.underlyingInfo(U1);
+    assertFalse(enabled, "underlying should be disabled after remove");
+
+    // 4) Add U1 again via the factory and re‑enable it
+    address[] memory tok = new address[](1);
+    tok[0] = U1;
+    vm.prank(OP);
+    factory.addUnderlyings(w, tok);
+
+    (enabled,,) = dw.underlyingInfo(U1);
+    assertTrue(enabled, "underlying should be re-enabled after addUnderlyings");
+
+    // 5) Wrap again to ensure the "remove → re‑add → reuse" flow works
+    vm.startPrank(ADMIN);
+    dw.wrap(U1, 1 ether, ADMIN);
+    vm.stopPrank();
+  }
+
   function test_Deprecate_MarksFlag() public {
     address[] memory a = new address[](1); a[0] = U1;
     vm.prank(OP);
@@ -368,6 +416,85 @@ contract FactoryTest is Test {
     factory.deprecate(w, "old");
     assertTrue(factory.deprecated(w));
     assertEq(factory.deprecateReason(w), "old");
+  }
+
+  // addUnderlyings on a deprecated wrapper should revert (audit Issue‑13 suggested testcase)
+  function test_AddUnderlyings_OnDeprecatedWrapper_Revert() public {
+    address[] memory a = new address[](0);
+    vm.prank(OP);
+    address w = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "dD", symbol: "dD", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    vm.prank(ADMIN);
+    factory.deprecate(w, "deprecated");
+
+    address[] memory tok = new address[](1);
+    tok[0] = U1;
+
+    vm.prank(OP);
+    // Expect InvalidParams("deprecated wrapper"); here we only assert revert, not the full encoded error.
+    vm.expectRevert();
+    factory.addUnderlyings(w, tok);
+  }
+
+  // Multi-wrapper + deprecation scenario: deprecate one wrapper, keep historical mapping, but forbid adding new underlyings to it
+  function test_Deprecate_OneOfMultipleWrappers_Behavior() public {
+    // 1) Create two wrappers that both include U1
+    address[] memory a = new address[](1);
+    a[0] = U1;
+
+    vm.prank(OP);
+    address w1 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d1", symbol: "d1", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    vm.prank(OP);
+    address w2 = factory.createWrapper(IDStockWrapper.InitParams({
+      admin: ADMIN, factoryRegistry: address(0), initialUnderlyings: a,
+      name: "d2", symbol: "d2", decimalsOverride: 0,
+      compliance: address(0), treasury: address(0), wrapFeeBps: 0, unwrapFeeBps: 0, cap: 0, termsURI: "t",
+      initialMultiplierRay: 1e18, feePerPeriodRay: 0, periodLength: 0, feeModel: 0
+    }));
+
+    // 2) Deprecate w1
+    vm.prank(ADMIN);
+    factory.deprecate(w1, "deprecated");
+    assertTrue(factory.deprecated(w1));
+
+    // 3) U1 should still map to both wrappers (historical record)
+    address[] memory ws = factory.getWrappers(U1);
+    assertEq(ws.length, 2, "U1 should still map to two wrappers");
+
+    bool foundW1;
+    bool foundW2;
+    for (uint256 i = 0; i < ws.length; i++) {
+      if (ws[i] == w1) foundW1 = true;
+      if (ws[i] == w2) foundW2 = true;
+    }
+    assertTrue(foundW1 && foundW2, "both wrappers should appear in mapping");
+
+    // 4) Calling addUnderlyings on deprecated w1 must fail
+    address[] memory tok = new address[](1);
+    tok[0] = U2;
+    vm.prank(OP);
+    // Expect InvalidParams("deprecated wrapper"); here we only assert revert, not the full encoded error.
+    vm.expectRevert();
+    factory.addUnderlyings(w1, tok);
+
+    // 5) Calling addUnderlyings on non‑deprecated w2 must succeed
+    vm.prank(OP);
+    factory.addUnderlyings(w2, tok);
+
+    address[] memory wrappersForU2 = factory.getWrappers(U2);
+    assertEq(wrappersForU2.length, 1);
+    assertEq(wrappersForU2[0], w2);
   }
 
   function test_SetUnderlyingStatusForWrapper_NotRegistered_Revert() public {
@@ -556,6 +683,278 @@ contract FactoryTest is Test {
     vm.prank(PAUSER);
     vm.expectRevert(DStockFactoryRegistry.NotRegistered.selector);
     factory.pauseWrapper(address(0xDEAD), true);
+  }
+
+  // ------------------------------------------------
+  // Global compliance setter
+  // ------------------------------------------------
+  function test_SetGlobalCompliance_Update_And_SameAddress_Revert() public {
+    // initial is GLOBAL_COMPLIANCE (0); set to non-zero
+    address newC = address(0x1234);
+
+    vm.prank(OP);
+    factory.setGlobalCompliance(newC);
+    assertEq(factory.globalCompliance(), newC, "globalCompliance not updated");
+
+    // setting to same address should revert with SameAddress
+    vm.prank(OP);
+    vm.expectRevert(DStockFactoryRegistry.SameAddress.selector);
+    factory.setGlobalCompliance(newC);
+  }
+
+  // ------------------------------------------------
+  // Pagination: getAllWrappers(offset, limit)
+  // ------------------------------------------------
+  function test_GetAllWrappers_Pagination() public {
+    // create three wrappers so that allWrappers has deterministic order
+    address[] memory a = new address[](1);
+    a[0] = U1;
+    vm.prank(OP);
+    address w1 = factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0),
+        initialUnderlyings: a,
+        name: "d1",
+        symbol: "d1",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "t1",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+
+    address[] memory b = new address[](1);
+    b[0] = U2;
+    vm.prank(OP);
+    address w2 = factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0),
+        initialUnderlyings: b,
+        name: "d2",
+        symbol: "d2",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "t2",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+
+    address[] memory c = new address[](1);
+    c[0] = U3;
+    vm.prank(OP);
+    address w3 = factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0),
+        initialUnderlyings: c,
+        name: "d3",
+        symbol: "d3",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "t3",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+
+    assertEq(factory.countWrappers(), 3, "countWrappers should be 3");
+
+    // page 0..2 (limit 2) -> [w1, w2]
+    address[] memory page = factory.getAllWrappers(0, 2);
+    assertEq(page.length, 2);
+    assertEq(page[0], w1);
+    assertEq(page[1], w2);
+
+    // page 1..3 (limit 2) -> [w2, w3]
+    page = factory.getAllWrappers(1, 2);
+    assertEq(page.length, 2);
+    assertEq(page[0], w2);
+    assertEq(page[1], w3);
+
+    // page near end; limit larger than remaining -> truncated to 1
+    page = factory.getAllWrappers(2, 10);
+    assertEq(page.length, 1);
+    assertEq(page[0], w3);
+
+    // offset >= countWrappers -> empty
+    page = factory.getAllWrappers(3, 1);
+    assertEq(page.length, 0);
+  }
+
+  // ------------------------------------------------
+  // addUnderlyings edge cases (deprecated wrapper, empty tokens)
+  // ------------------------------------------------
+  function test_AddUnderlyings_RevertOnDeprecatedOrEmptyTokens() public {
+    // create wrapper with a single underlying
+    address[] memory a = new address[](1);
+    a[0] = U1;
+    vm.prank(OP);
+    address w = factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0),
+        initialUnderlyings: a,
+        name: "dA",
+        symbol: "dA",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "tA",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+
+    // empty tokens array -> InvalidParams("empty tokens")
+    address[] memory empty = new address[](0);
+    vm.prank(OP);
+    vm.expectRevert(
+      abi.encodeWithSelector(
+        DStockFactoryRegistry.InvalidParams.selector,
+        "empty tokens"
+      )
+    );
+    factory.addUnderlyings(w, empty);
+
+    // deprecate wrapper -> addUnderlyings should revert with InvalidParams("deprecated wrapper")
+    vm.prank(OP);
+    factory.deprecate(w, "deprecated");
+
+    address[] memory tok = new address[](1);
+    tok[0] = U2;
+    vm.prank(OP);
+    vm.expectRevert(
+      abi.encodeWithSelector(
+        DStockFactoryRegistry.InvalidParams.selector,
+        "deprecated wrapper"
+      )
+    );
+    factory.addUnderlyings(w, tok);
+  }
+
+  // ------------------------------------------------
+  // removeUnderlyingMappingForWrapper: NotRegistered path
+  // ------------------------------------------------
+  function test_RemoveUnderlyingMappingForWrapper_NotRegistered_Revert() public {
+    address[] memory a = new address[](1);
+    a[0] = U1;
+    vm.prank(OP);
+    address w = factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0),
+        initialUnderlyings: a,
+        name: "d1",
+        symbol: "d1",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "t",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+
+    // U2 was never mapped to w -> NotRegistered
+    vm.prank(OP);
+    vm.expectRevert(DStockFactoryRegistry.NotRegistered.selector);
+    factory.removeUnderlyingMappingForWrapper(w, U2);
+  }
+
+  // ------------------------------------------------
+  // createWrapper: invalid inputs (zero address in initialUnderlyings)
+  // ------------------------------------------------
+  function test_CreateWrapper_InitialUnderlyings_ZeroAddress_Revert() public {
+    address[] memory initU = new address[](2);
+    initU[0] = U1;
+    initU[1] = address(0);
+
+    vm.prank(OP);
+    vm.expectRevert(DStockFactoryRegistry.ZeroAddress.selector);
+    factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0),
+        initialUnderlyings: initU,
+        name: "dBad",
+        symbol: "dBad",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "tBad",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+  }
+
+  // ------------------------------------------------
+  // createWrapper: caller-supplied factoryRegistry is ignored and overwritten to factory address
+  // ------------------------------------------------
+  function test_CreateWrapper_OverridesFactoryRegistryToSelf() public {
+    address[] memory initU = new address[](1);
+    initU[0] = U1;
+
+    vm.prank(OP);
+    address w = factory.createWrapper(
+      IDStockWrapper.InitParams({
+        admin: ADMIN,
+        factoryRegistry: address(0xDEAD), // will be overridden inside createWrapper
+        initialUnderlyings: initU,
+        name: "dF",
+        symbol: "dF",
+        decimalsOverride: 0,
+        compliance: address(0),
+        treasury: address(0),
+        wrapFeeBps: 0,
+        unwrapFeeBps: 0,
+        cap: 0,
+        termsURI: "tF",
+        initialMultiplierRay: 1e18,
+        feePerPeriodRay: 0,
+        periodLength: 0,
+        feeModel: 0
+      })
+    );
+
+    assertEq(IDStockWrapper(w).factoryRegistry(), address(factory), "factoryRegistry should be factory");
   }
 
   // ------------------------------------------------

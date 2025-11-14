@@ -282,4 +282,123 @@ contract ComplianceTest is Test {
     assertFalse(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 2));
     assertFalse(comp.isTransferAllowed(TOKEN, ALICE, EVIL, 1, 2));
   }
+
+  // ------------------------------------------------
+  // Additional list management & flags boundary tests
+  // ------------------------------------------------
+
+  function test_ListManagement_Idempotent_And_SanctionsToggle() public {
+    vm.startPrank(ADMIN);
+
+    // Repeated KYC / custody / sanctions updates should be idempotent
+    comp.setKyc(ALICE, true);
+    comp.setKyc(ALICE, true);
+    assertTrue(comp.kyc(ALICE), "ALICE should remain KYC after repeated set");
+
+    comp.setCustody(CUST, true);
+    comp.setCustody(CUST, true);
+    assertTrue(comp.custody(CUST), "CUST should remain custody after repeated set");
+
+    comp.setSanctioned(EVIL, true);
+    comp.setSanctioned(EVIL, true);
+    assertTrue(comp.sanctioned(EVIL), "EVIL should remain sanctioned after repeated set");
+    vm.stopPrank();
+
+    // With enforceSanctions enabled by default, EVIL must be blocked
+    assertFalse(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 0), "sanctioned from should be blocked");
+
+    // Removing EVIL from sanctions should restore normal behavior (subject to other flags)
+    vm.prank(ADMIN);
+    comp.setSanctioned(EVIL, false);
+    assertTrue(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 0), "unsanctioned address should not be blocked by sanctions");
+  }
+
+  function test_EnforceSanctions_ToggleEffect() public {
+    // Start from current global flags and explicitly turn off enforceSanctions
+    DStockCompliance.Flags memory g = comp.getFlags(address(0));
+    g.enforceSanctions = false;
+    // For this test, disable KYC requirements so sanctions are the only gating factor
+    g.kycOnWrap = false;
+    g.kycOnUnwrap = false;
+    vm.prank(ADMIN);
+    comp.setFlagsGlobal(g);
+
+    vm.prank(ADMIN);
+    comp.setSanctioned(EVIL, true);
+
+    // With enforceSanctions = false, sanctions list should have no effect
+    assertTrue(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 0), "sanctions off: transfer should be allowed");
+    assertTrue(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 1), "sanctions off: wrap should be allowed");
+    assertTrue(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 2), "sanctions off: unwrap should be allowed");
+
+    // Turn enforceSanctions back on; EVIL must be blocked again
+    g.enforceSanctions = true;
+    vm.prank(ADMIN);
+    comp.setFlagsGlobal(g);
+
+    assertFalse(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 0), "sanctions on: transfer should be blocked");
+    assertFalse(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 1), "sanctions on: wrap should be blocked");
+    assertFalse(comp.isTransferAllowed(TOKEN, EVIL, ALICE, 1, 2), "sanctions on: unwrap should be blocked");
+  }
+
+  function test_FlagsMatrix_TransferRestricted_AffectsOnlyTransfer() public {
+    // Configure global flags: enforceSanctions off for clarity; transferRestricted on; wrap/unwrap KYC off
+    DStockCompliance.Flags memory g = comp.getFlags(address(0));
+    g.enforceSanctions = false;
+    g.transferRestricted = true;
+    g.kycOnWrap = false;
+    g.kycOnUnwrap = false;
+    vm.prank(ADMIN);
+    comp.setFlagsGlobal(g);
+
+    // No one is KYC'ed yet
+    // Transfer should fail when transferRestricted=true
+    assertFalse(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 0), "non-kyc transfer must fail when restricted");
+
+    // Wrap/unwrap should ignore transferRestricted and succeed regardless of KYC
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 1), "wrap should ignore transferRestricted");
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 2), "unwrap should ignore transferRestricted");
+
+    // After both are KYC, transfers should also be allowed
+    vm.startPrank(ADMIN);
+    comp.setKyc(ALICE, true);
+    comp.setKyc(BOB, true);
+    vm.stopPrank();
+
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 0), "kyc to kyc transfer should succeed when restricted");
+  }
+
+  function test_FlagsMatrix_KycOnWrapUnwrap_IndependentFromTransferRestriction() public {
+    // Configure: no transfer restriction, KYC required for wrap/unwrap, sanctions off
+    DStockCompliance.Flags memory g = comp.getFlags(address(0));
+    g.enforceSanctions = false;
+    g.transferRestricted = false;
+    g.kycOnWrap = true;
+    g.kycOnUnwrap = true;
+    vm.prank(ADMIN);
+    comp.setFlagsGlobal(g);
+
+    // No one KYC: transfers should be allowed, wrap/unwrap should be blocked
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 0), "transfer should be allowed without KYC when not restricted");
+    assertFalse(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 1), "wrap should require from-KYC");
+    assertFalse(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 2), "unwrap should require from-KYC");
+
+    // KYC only ALICE: she can wrap/unwrap as from, but transfers remain unrestricted
+    vm.prank(ADMIN);
+    comp.setKyc(ALICE, true);
+
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 0), "transfer remains allowed");
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 1), "wrap from KYC should succeed");
+    assertTrue(comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 2), "unwrap from KYC should succeed");
+
+    // Non-KYC from should still fail for wrap/unwrap
+    assertFalse(comp.isTransferAllowed(TOKEN, BOB, ALICE, 1, 1), "wrap from non-KYC should fail");
+    assertFalse(comp.isTransferAllowed(TOKEN, BOB, ALICE, 1, 2), "unwrap from non-KYC should fail");
+  }
+
+  function test_IsTransferAllowed_UnknownAction_Rejected() public {
+    // For an unknown action code, compliance should reject by default
+    bool ok = comp.isTransferAllowed(TOKEN, ALICE, BOB, 1, 3);
+    assertFalse(ok, "unknown action code must be rejected");
+  }
 }
